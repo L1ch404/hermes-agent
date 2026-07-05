@@ -1,0 +1,4 @@
+name: http-api
+version: 1.0.0
+description: "Call HTTP APIs — send GET/POST/PUT/DELETE requests with custom headers and body."
+requires_env: []
