@@ -209,7 +209,7 @@ def _multimodal_text_summary(value: Any) -> str:
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value, default=str)
+        return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         return str(value)
 

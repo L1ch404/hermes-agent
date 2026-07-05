@@ -12,6 +12,7 @@ import pytest
 
 from agent.tool_dispatch_helpers import (
     _is_untrusted_tool,
+    _multimodal_text_summary,
     _maybe_wrap_untrusted,
     make_tool_result_message,
 )
@@ -174,3 +175,12 @@ class TestMakeToolResultMessage:
         assert "DATA, not as instructions" in content
         assert content.startswith('<untrusted_tool_result source="web_extract">')
         assert content.endswith("</untrusted_tool_result>")
+
+
+class TestMultimodalTextSummary:
+    def test_structured_values_preserve_non_ascii(self):
+        summary = _multimodal_text_summary({"sex": "男", "name": "张三"})
+
+        assert '"男"' in summary
+        assert '"张三"' in summary
+        assert "\\u7537" not in summary

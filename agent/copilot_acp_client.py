@@ -214,7 +214,7 @@ def _render_message_content(content: Any) -> str:
             return str(content.get("text") or "").strip()
         if "content" in content and isinstance(content.get("content"), str):
             return str(content.get("content") or "").strip()
-        return json.dumps(content, ensure_ascii=True)
+        return json.dumps(content, ensure_ascii=False)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:

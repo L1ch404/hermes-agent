@@ -583,7 +583,7 @@ def convert_messages_to_converse(
         if role == "tool":
             # Tool result messages → merge into the preceding user turn
             tool_call_id = msg.get("tool_call_id", "")
-            result_content = content if isinstance(content, str) else json.dumps(content)
+            result_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
             tool_result_block = {
                 "toolResult": {
                     "toolUseId": tool_call_id,

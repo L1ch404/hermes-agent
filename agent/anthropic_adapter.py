@@ -2041,7 +2041,7 @@ def _convert_tool_message_to_result(
     elif isinstance(content, str):
         result_content = content
     else:
-        result_content = json.dumps(content) if content else "(no output)"
+        result_content = json.dumps(content, ensure_ascii=False) if content else "(no output)"
     if not result_content:
         result_content = "(no output)"
     tool_result = {
