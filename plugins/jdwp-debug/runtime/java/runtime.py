@@ -11,6 +11,7 @@ LLM never sees JDWP, thread IDs, or protocol details.
 
 from __future__ import annotations
 
+import logging
 import struct
 import time
 import uuid
@@ -25,6 +26,14 @@ from ..base import (
 from .jdwp import JDWPClient, JDWPError, Cmd, EventKind, Tag
 from .process import ProcessManager
 from .log import LogManager
+
+logger = logging.getLogger(__name__)
+
+
+def _error_summary(error: Exception) -> str:
+    """Return one safe diagnostic line, excluding captured application logs."""
+    message = str(error)
+    return message.splitlines()[0][:240] if message else "-"
 
 
 @dataclass
@@ -56,6 +65,15 @@ class JavaRuntime(Runtime):
     # ── Lifecycle ──────────────────────────────────────
 
     def run(self, action: RuntimeAction) -> RuntimeResult:
+        logger.info(
+            "java_runtime.jvm.run.request main_class=%s classpath=%s jdwp_port=%s "
+            "app_args_count=%s vm_args_count=%s",
+            action.main_class or "-",
+            action.classpath,
+            action.jdwp_port,
+            len(action.app_args or []),
+            len(action.vm_args or []),
+        )
         try:
             self._reset_debug_state()
             self._host = "127.0.0.1"
@@ -68,29 +86,60 @@ class JavaRuntime(Runtime):
                 vm_args=action.vm_args,
                 log_file=log_file,
             )
-            return RuntimeResult(ok=True, data={
+            result = RuntimeResult(ok=True, data={
                 "status": "started",
                 "pid": info.pid,
                 "jdwp_port": info.jdwp_port,
                 "log_file": log_file,
                 "main_class": info.main_class,
             })
+            logger.info(
+                "java_runtime.jvm.run.ready pid=%s main_class=%s jdwp_port=%s log_file=%s",
+                info.pid, info.main_class, info.jdwp_port, log_file,
+            )
+            return result
         except Exception as e:
+            logger.error(
+                "java_runtime.jvm.run.failed main_class=%s jdwp_port=%s "
+                "error_type=%s error=%s",
+                action.main_class or "-", action.jdwp_port,
+                type(e).__name__, _error_summary(e),
+            )
             return RuntimeResult(ok=False, error=str(e))
 
     def stop(self, action: RuntimeAction) -> RuntimeResult:
+        current = self._proc.current
+        logger.info(
+            "java_runtime.jvm.stop.request pid=%s ownership=%s suspended=%s",
+            current.pid if current is not None else "-",
+            (
+                "launched" if current is not None and current.owned
+                else "attached" if current is not None
+                else "absent"
+            ),
+            self._active_suspension is not None,
+        )
         self._disconnect()
         self._breakpoints.clear()
         self._invalidate_suspension()
         data = self._proc.stop()
+        logger.info(
+            "java_runtime.jvm.stop.finish status=%s pid=%s",
+            data.get("status", "-"), data.get("pid", "-"),
+        )
         return RuntimeResult(ok=True, data=data)
 
     def restart(self, action: RuntimeAction) -> RuntimeResult:
+        logger.info("java_runtime.jvm.restart.request main_class=%s", action.main_class or "-")
         self.stop(action)
         time.sleep(1)
         return self.run(action)
 
     def attach(self, action: RuntimeAction) -> RuntimeResult:
+        logger.info(
+            "java_runtime.jvm.attach.request pid=%s endpoint=%s:%s main_class=%s",
+            action.pid, action.host, action.jdwp_port, action.main_class or "-",
+        )
         current = self._proc.current
         if current is not None and current.is_alive():
             return RuntimeResult(
@@ -115,6 +164,10 @@ class JavaRuntime(Runtime):
                 host=self._host,
             )
             self._connect()
+            logger.info(
+                "java_runtime.jvm.attach.ready pid=%s endpoint=%s:%s",
+                info.pid, self._host, info.jdwp_port,
+            )
             return RuntimeResult(ok=True, data={
                 "status": "attached",
                 "pid": info.pid,
@@ -123,11 +176,23 @@ class JavaRuntime(Runtime):
                 "main_class": info.main_class,
             })
         except Exception as e:
+            logger.error(
+                "java_runtime.jvm.attach.failed pid=%s endpoint=%s:%s "
+                "error_type=%s error=%s",
+                action.pid, action.host, action.jdwp_port,
+                type(e).__name__, _error_summary(e),
+            )
             self._disconnect()
             self._proc.detach()
             return RuntimeResult(ok=False, error=str(e))
 
     def detach(self, action: RuntimeAction) -> RuntimeResult:
+        current = self._proc.current
+        logger.info(
+            "java_runtime.jvm.detach.request pid=%s suspended=%s",
+            current.pid if current is not None else "-",
+            self._active_suspension is not None,
+        )
         if self._active_suspension is not None and self._jdwp is not None:
             try:
                 err, _ = self._jdwp.command(Cmd.VM, 9)
@@ -148,6 +213,10 @@ class JavaRuntime(Runtime):
         else:
             data = self._proc.detach()
         self._host = "127.0.0.1"
+        logger.info(
+            "java_runtime.jvm.detach.finish status=%s pid=%s",
+            data.get("status", "-"), data.get("pid", "-"),
+        )
         return RuntimeResult(ok=True, data=data)
 
     # ── Observation ────────────────────────────────────
@@ -226,6 +295,11 @@ class JavaRuntime(Runtime):
         if not self._proc.is_running:
             return RuntimeResult(ok=False, error="No application running")
 
+        logger.info(
+            "java_runtime.breakpoint.request operation=%s class_pattern=%s line=%s active_count=%s",
+            action.bp_action, action.class_pattern or "-", action.line or "-",
+            len(self._breakpoints),
+        )
         try:
             jdwp = self._connect()
 
@@ -332,6 +406,11 @@ class JavaRuntime(Runtime):
                     "line": action.line,
                 }
 
+                logger.info(
+                    "java_runtime.breakpoint.set request_id=%s class=%s method=%s line=%s",
+                    request_id, found_sig, found_mname, action.line,
+                )
+
                 return RuntimeResult(ok=True, data={
                     "bp_action": "set",
                     "request_id": request_id,
@@ -355,12 +434,20 @@ class JavaRuntime(Runtime):
 
                 if not removed:
                     return RuntimeResult(ok=False, error="Failed to clear any breakpoints")
+                logger.info(
+                    "java_runtime.breakpoint.removed request_ids=%s remaining=%s",
+                    removed, len(self._breakpoints),
+                )
                 return RuntimeResult(ok=True, data={"bp_action": "remove", "cleared_ids": removed})
 
             else:
                 return RuntimeResult(ok=False, error=f"Unknown bp_action: {action.bp_action}")
 
         except JDWPError as e:
+            logger.warning(
+                "java_runtime.breakpoint.failed operation=%s class_pattern=%s line=%s error=%s",
+                action.bp_action, action.class_pattern or "-", action.line or "-", e,
+            )
             return RuntimeResult(ok=False, error=str(e))
 
     def wait_breakpoint(self, action: RuntimeAction) -> RuntimeResult:
@@ -369,12 +456,21 @@ class JavaRuntime(Runtime):
         if not self._breakpoints:
             return RuntimeResult(ok=False, error="No breakpoints set")
         if self._active_suspension is not None:
+            logger.info(
+                "java_runtime.breakpoint.wait.already_suspended suspension=%s generation=%s",
+                self._active_suspension.suspension_id,
+                self._active_suspension.generation,
+            )
             return RuntimeResult(ok=True, data={
                 "status": "already_suspended",
                 **self._snapshot_context(self._active_suspension),
             })
 
         try:
+            logger.info(
+                "java_runtime.breakpoint.wait.start timeout_seconds=%s active_breakpoints=%s",
+                action.timeout, len(self._breakpoints),
+            )
             jdwp = self._connect()
             deadline = time.monotonic() + max(action.timeout, 0.1)
             while True:
@@ -410,16 +506,28 @@ class JavaRuntime(Runtime):
                         observed_at=datetime.now(timezone.utc).isoformat(),
                     )
                     self._active_suspension = snapshot
+                    location_description = self._describe_location(jdwp, snapshot.location)
+                    thread_name = self._thread_name(jdwp, snapshot.thread_id)
+                    logger.info(
+                        "java_runtime.breakpoint.hit suspension=%s generation=%s request_id=%s "
+                        "thread=%s class=%s method=%s line=%s",
+                        snapshot.suspension_id,
+                        snapshot.generation,
+                        request_id,
+                        thread_name,
+                        location_description.get("class", "-"),
+                        location_description.get("method", "-"),
+                        location_description.get("line", "-"),
+                    )
                     return RuntimeResult(ok=True, data={
                         "status": "breakpoint_hit",
                         **self._snapshot_context(snapshot),
                         "breakpoint": self._breakpoints[request_id],
-                        "thread": {
-                            "name": self._thread_name(jdwp, snapshot.thread_id),
-                        },
-                        "location": self._describe_location(jdwp, snapshot.location),
+                        "thread": {"name": thread_name},
+                        "location": location_description,
                     })
         except (JDWPError, OSError) as e:
+            logger.warning("java_runtime.breakpoint.wait.failed error=%s", e)
             return RuntimeResult(ok=False, error=str(e))
 
     def threads(self, action: RuntimeAction) -> RuntimeResult:
@@ -443,6 +551,10 @@ class JavaRuntime(Runtime):
                     row["state"] = "unknown"
                     row["suspended"] = None
                 rows.append(row)
+            logger.info(
+                "java_runtime.threads.observed suspension=%s count=%s breakpoint_thread=%s",
+                snapshot.suspension_id, len(rows), self._thread_name(jdwp, snapshot.thread_id),
+            )
             return RuntimeResult(ok=True, data={
                 **self._snapshot_context(snapshot),
                 "thread_count": len(rows),
@@ -457,6 +569,13 @@ class JavaRuntime(Runtime):
             jdwp = self._connect()
             thread_id = self._resolve_thread_id(jdwp, snapshot, action.thread_name)
             frames = self._read_frames(jdwp, thread_id, action.max_frames)
+            logger.info(
+                "java_runtime.stack.observed suspension=%s thread=%s frame_count=%s requested_max=%s",
+                snapshot.suspension_id,
+                self._thread_name(jdwp, thread_id),
+                len(frames),
+                action.max_frames,
+            )
             return RuntimeResult(ok=True, data={
                 **self._snapshot_context(snapshot),
                 "thread": {"name": self._thread_name(jdwp, thread_id)},
@@ -549,6 +668,19 @@ class JavaRuntime(Runtime):
                 self._variable_observation(variable) for variable in variables
             ]
             complete = all(variable.value_observed for variable in variables)
+            observed_count = sum(variable.value_observed for variable in variables)
+            unavailable_count = len(variables) - observed_count
+            logger.info(
+                "java_runtime.variables.observed suspension=%s thread=%s frame_index=%s "
+                "total=%s observed=%s unavailable=%s complete=%s",
+                snapshot.suspension_id,
+                self._thread_name(jdwp, thread_id),
+                action.frame_index,
+                len(variables),
+                observed_count,
+                unavailable_count,
+                complete,
+            )
 
             return RuntimeResult(ok=True, data={
                 **self._snapshot_context(snapshot),
@@ -572,6 +704,10 @@ class JavaRuntime(Runtime):
                 return RuntimeResult(ok=False, error=f"VM resume failed (err {err})")
             suspension_id = snapshot.suspension_id
             self._invalidate_suspension()
+            logger.info(
+                "java_runtime.suspension.resumed suspension=%s generation=%s",
+                suspension_id, snapshot.generation,
+            )
             return RuntimeResult(ok=True, data={
                 "status": "resumed",
                 "invalidated_suspension_id": suspension_id,
@@ -584,6 +720,10 @@ class JavaRuntime(Runtime):
     # ── Internal ───────────────────────────────────────
 
     def _breakpoint_timeout(self, timeout: float) -> RuntimeResult:
+        logger.info(
+            "java_runtime.breakpoint.wait.timeout timeout_seconds=%s process_running=%s",
+            timeout, self._proc.is_running,
+        )
         return RuntimeResult(ok=True, data={
             "status": "timeout",
             "timeout_seconds": timeout,
@@ -598,6 +738,11 @@ class JavaRuntime(Runtime):
 
     def _invalidate_suspension(self) -> None:
         if self._active_suspension is not None:
+            logger.info(
+                "java_runtime.suspension.invalidated suspension=%s generation=%s",
+                self._active_suspension.suspension_id,
+                self._active_suspension.generation,
+            )
             self._active_suspension.valid = False
         self._active_suspension = None
 
@@ -1168,8 +1313,14 @@ class JavaRuntime(Runtime):
                 # ``command`` multiplexes interleaved events into its event
                 # queue, so probing the connection cannot discard a hit.
                 self._jdwp.command(Cmd.VM, 1)  # Version
+                logger.debug("java_runtime.jdwp.connection.reused")
                 return self._jdwp
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "java_runtime.jdwp.connection.stale error_type=%s error=%s",
+                    type(exc).__name__,
+                    str(exc).splitlines()[0] if str(exc) else "-",
+                )
                 try:
                     self._jdwp.close()
                 except Exception:
@@ -1179,6 +1330,10 @@ class JavaRuntime(Runtime):
         proc = self._proc.current
         if proc is None or not proc.is_alive():
             raise RuntimeError("No application running — cannot connect debugger")
+        logger.info(
+            "java_runtime.jdwp.connection.open pid=%s host=%s port=%s timeout=%s",
+            proc.pid, self._host, proc.jdwp_port, timeout,
+        )
         jdwp.connect(self._host, proc.jdwp_port, timeout)
         self._jdwp = jdwp
         return jdwp
@@ -1186,6 +1341,7 @@ class JavaRuntime(Runtime):
     def _disconnect(self) -> None:
         """Close the persistent JDWP connection."""
         if self._jdwp is not None:
+            logger.info("java_runtime.jdwp.connection.close")
             try:
                 self._jdwp.close()
             except Exception:

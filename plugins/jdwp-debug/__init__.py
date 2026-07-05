@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from .runtime.base import RuntimeAction, Runtime
 from .runtime.java.runtime import JavaRuntime
@@ -133,6 +134,13 @@ JAVA_RUNTIME_SCHEMA = {
 _runtimes: dict[str, Runtime] = {}
 
 
+def _log_error_summary(error: str) -> str:
+    """Keep logs diagnostic without copying application output into agent.log."""
+    if not error:
+        return "-"
+    return error.splitlines()[0][:240]
+
+
 def _get_runtime(context_key: str = "default") -> Runtime:
     """Return the runtime isolated to one Hermes conversation/session."""
     key = context_key or "default"
@@ -140,10 +148,12 @@ def _get_runtime(context_key: str = "default") -> Runtime:
     if runtime is None:
         runtime = JavaRuntime()
         _runtimes[key] = runtime
+        logger.info("java_runtime.session.created context=%s", key)
     return runtime
 
 
 def _handle_java_runtime(args: dict, **kw) -> str:
+    started_at = time.monotonic()
     action = RuntimeAction(
         action=args.get("action", "status"),
         classpath=args.get("classpath", "."),
@@ -163,13 +173,21 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         timeout=float(args.get("timeout", 30)),
         suspension_id=args.get("suspension_id", ""),
     )
-    logger.info(f"\n{'=' * 60}")
-    logger.info(f"[java_runtime] action = {action.action}")
-    print(f"\n{'=' * 60}")
-    print(f"[java_runtime] action = {action.action}")
-
     context_key = str(kw.get("session_id") or kw.get("task_id") or "default")
     rt = _get_runtime(context_key)
+    logger.info(
+        "java_runtime.action.start action=%s context=%s pid=%s main_class=%s "
+        "jdwp=%s:%s breakpoint=%s:%s suspension=%s",
+        action.action,
+        context_key,
+        action.pid or "-",
+        action.main_class or "-",
+        action.host,
+        action.jdwp_port,
+        action.class_pattern or "-",
+        action.line or "-",
+        action.suspension_id or "-",
+    )
 
     dispatch = {
         "run":        rt.run,
@@ -189,16 +207,57 @@ def _handle_java_runtime(args: dict, **kw) -> str:
 
     handler = dispatch.get(action.action)
     if handler is None:
-        result = json.dumps({"error": f"Unknown action: {action.action}"})
+        error = f"Unknown action: {action.action}"
+        logger.warning("java_runtime.action.invalid action=%s context=%s", action.action, context_key)
+        logger.warning(
+            "java_runtime.action.finish action=%s context=%s ok=False "
+            "duration_ms=%.1f error=%s",
+            action.action, context_key,
+            (time.monotonic() - started_at) * 1000,
+            _log_error_summary(error),
+        )
+        result = json.dumps({"ok": False, "error": error}, ensure_ascii=False)
     else:
         try:
             rr = handler(action)
             result = rr.to_json()
+            data = rr.data or {}
+            log_finish = logger.warning if rr.error else logger.info
+            log_finish(
+                "java_runtime.action.finish action=%s context=%s ok=%s duration_ms=%.1f "
+                "status=%s process=%s debug=%s pid=%s suspension=%s "
+                "threads=%s frames=%s variables=%s complete=%s error=%s",
+                action.action,
+                context_key,
+                not bool(rr.error) and rr.ok,
+                (time.monotonic() - started_at) * 1000,
+                data.get("status", "-"),
+                data.get("process_state", "-"),
+                data.get("debug_state", "-"),
+                data.get("pid", "-"),
+                data.get("suspension_id", data.get("invalidated_suspension_id", "-")),
+                data.get("thread_count", "-"),
+                data.get("frame_count", "-"),
+                data.get("variable_count", "-"),
+                data.get("complete", "-"),
+                _log_error_summary(rr.error),
+            )
         except Exception as e:
-            result = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
-
-    print(f"[java_runtime] 返回值: {result[:500]}")
-    print(f"{'=' * 60}\n")
+            logger.exception(
+                "java_runtime.action.crash action=%s context=%s duration_ms=%.1f",
+                action.action,
+                context_key,
+                (time.monotonic() - started_at) * 1000,
+            )
+            error = f"{type(e).__name__}: {e}"
+            logger.error(
+                "java_runtime.action.finish action=%s context=%s ok=False "
+                "duration_ms=%.1f error=%s",
+                action.action, context_key,
+                (time.monotonic() - started_at) * 1000,
+                _log_error_summary(error),
+            )
+            result = json.dumps({"ok": False, "error": error}, ensure_ascii=False)
     return result
 
 

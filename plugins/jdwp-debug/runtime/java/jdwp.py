@@ -14,12 +14,16 @@ Does NOT provide:
 
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class JDWPError(Exception):
@@ -138,16 +142,43 @@ class JDWPClient:
     # -- connection --
 
     def connect(self, host: str, port: int, timeout: float = 5.0) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(timeout)
-        self._sock.connect((host, port))
-        self._sock.sendall(b"JDWP-Handshake")
-        reply = self._recv(14)
-        if reply != b"JDWP-Handshake":
-            raise JDWPError(-1, f"Handshake failed: {reply!r}")
-        self._query_id_sizes()
+        started_at = time.monotonic()
+        logger.info(
+            "java_runtime.jdwp.connect.start host=%s port=%s timeout=%s",
+            host, port, timeout,
+        )
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(timeout)
+            self._sock.connect((host, port))
+            self._sock.sendall(b"JDWP-Handshake")
+            reply = self._recv(14)
+            if reply != b"JDWP-Handshake":
+                raise JDWPError(-1, "Handshake failed")
+            self._query_id_sizes()
+        except Exception as exc:
+            logger.warning(
+                "java_runtime.jdwp.connect.failed host=%s port=%s elapsed_ms=%.1f "
+                "error_type=%s error=%s",
+                host, port, (time.monotonic() - started_at) * 1000,
+                type(exc).__name__, str(exc).splitlines()[0] if str(exc) else "-",
+            )
+            self.close()
+            raise
+        ids = self.ids
+        logger.info(
+            "java_runtime.jdwp.connect.ready host=%s port=%s elapsed_ms=%.1f "
+            "field_id=%s method_id=%s object_id=%s ref_type_id=%s frame_id=%s",
+            host, port, (time.monotonic() - started_at) * 1000,
+            ids.field_id_size if ids else "-",
+            ids.method_id_size if ids else "-",
+            ids.object_id_size if ids else "-",
+            ids.reference_type_id_size if ids else "-",
+            ids.frame_id_size if ids else "-",
+        )
 
     def close(self) -> None:
+        was_connected = self._sock is not None
         if self._sock:
             try:
                 self._sock.close()
@@ -156,6 +187,8 @@ class JDWPClient:
             self._sock = None
         self._pending_replies.clear()
         self._pending_events.clear()
+        if was_connected:
+            logger.info("java_runtime.jdwp.connection.closed")
 
     def _recv(self, n: int) -> bytes:
         buf = b""
@@ -288,25 +321,36 @@ class JDWPClient:
         # Event/Composite is a target-to-debugger notification.  The JDWP
         # specification explicitly says VM events do not require a reply.
         if packet["command_set"] == 64 and packet["command"] == 100:
-            self._pending_events.append(
-                self._parse_composite_event(packet["data"])
+            composite = self._parse_composite_event(packet["data"])
+            self._pending_events.append(composite)
+            logger.debug(
+                "java_runtime.jdwp.event.queued packet_id=%s suspend_policy=%s "
+                "event_count=%s event_kinds=%s request_ids=%s",
+                packet["id"], composite["suspend_policy"],
+                len(composite["events"]),
+                [event.get("kind") for event in composite["events"]],
+                [event.get("request_id") for event in composite["events"]],
             )
 
     def wait_for_event(self, timeout: float = 30.0) -> dict | None:
         """Wait for the next VM event, returning ``None`` on timeout."""
         if self._pending_events:
+            logger.debug("java_runtime.jdwp.event.dequeue source=pending")
             return self._pending_events.popleft()
 
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                logger.debug("java_runtime.jdwp.event.wait.timeout timeout=%s", timeout)
                 return None
             try:
                 self._route_packet(self._read_packet(timeout=remaining))
             except socket.timeout:
+                logger.debug("java_runtime.jdwp.event.wait.timeout timeout=%s", timeout)
                 return None
             if self._pending_events:
+                logger.debug("java_runtime.jdwp.event.dequeue source=socket")
                 return self._pending_events.popleft()
 
     def drain_events(self) -> list[dict]:
@@ -333,7 +377,20 @@ class JDWPClient:
         self._counter += 1
         packet_id = self._counter
         raw = _pack_cmd(cmd_set, cmd, data, packet_id)
+        started_at = time.monotonic()
+        logger.debug(
+            "java_runtime.jdwp.command.send packet_id=%s command_set=%s command=%s "
+            "request_bytes=%s",
+            packet_id, cmd_set, cmd, len(data),
+        )
         self._sock.sendall(raw)
         while packet_id not in self._pending_replies:
             self._route_packet(self._read_packet())
-        return self._pending_replies.pop(packet_id)
+        error, reply = self._pending_replies.pop(packet_id)
+        logger.debug(
+            "java_runtime.jdwp.command.reply packet_id=%s command_set=%s command=%s "
+            "error_code=%s response_bytes=%s elapsed_ms=%.1f",
+            packet_id, cmd_set, cmd, error, len(reply),
+            (time.monotonic() - started_at) * 1000,
+        )
+        return error, reply

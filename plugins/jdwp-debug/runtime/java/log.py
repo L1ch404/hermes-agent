@@ -4,9 +4,13 @@ Java log manager — reads console output from a rotating log file.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import time
+
+
+logger = logging.getLogger(__name__)
 
 
 class LogManager:
@@ -23,6 +27,10 @@ class LogManager:
         self._current_file = os.path.join(
             self._base_dir, f"{main_class}-{ts}.log"
         )
+        logger.info(
+            "java_runtime.console_log.created main_class=%s path=%s",
+            main_class or "-", self._current_file,
+        )
         return self._current_file
 
     @property
@@ -32,14 +40,25 @@ class LogManager:
     def tail(self, n: int = 50) -> dict:
         """Return the last N lines of the current log."""
         if not self._current_file:
+            logger.warning("java_runtime.console_log.tail.failed reason=no_log_file")
             return {"error": "No log file created"}
         try:
             with open(self._current_file, "r") as f:
                 lines = f.readlines()
-            return {
+            result = {
                 "lines": lines[-n:] if n > 0 else lines,
                 "total_lines": len(lines),
                 "log_file": self._current_file,
             }
+            logger.info(
+                "java_runtime.console_log.tail path=%s requested_lines=%s "
+                "returned_lines=%s total_lines=%s",
+                self._current_file, n, len(result["lines"]), len(lines),
+            )
+            return result
         except FileNotFoundError:
+            logger.warning(
+                "java_runtime.console_log.tail.failed reason=not_found path=%s",
+                self._current_file,
+            )
             return {"error": f"Log file not found: {self._current_file}"}

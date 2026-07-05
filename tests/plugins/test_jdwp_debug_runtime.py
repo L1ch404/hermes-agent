@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import shutil
 import socket
 import struct
@@ -76,7 +77,29 @@ def test_plugin_runtime_is_isolated_per_hermes_session() -> None:
     assert plugin_module._runtimes["session-a"] is not plugin_module._runtimes["session-b"]
 
 
-def test_command_queues_interleaved_breakpoint_event() -> None:
+def test_handler_logs_observable_lifecycle_without_argument_values(caplog) -> None:
+    plugin_module._runtimes.clear()
+    caplog.set_level(logging.INFO)
+
+    result = json.loads(plugin_module._handle_java_runtime(
+        {
+            "action": "status",
+            "app_args": ["do-not-log-this-value"],
+            "vm_args": ["-Dpassword=do-not-log-this-value"],
+        },
+        session_id="logging-session",
+    ))
+
+    assert result["process_state"] == "absent"
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "java_runtime.session.created context=logging-session" in messages
+    assert "java_runtime.action.start action=status context=logging-session" in messages
+    assert "java_runtime.action.finish action=status context=logging-session" in messages
+    assert "do-not-log-this-value" not in messages
+
+
+def test_command_queues_interleaved_breakpoint_event(caplog) -> None:
+    caplog.set_level(logging.DEBUG)
     client_sock, vm_sock = socket.socketpair()
     client = JDWPClient()
     client._sock = client_sock
@@ -121,6 +144,10 @@ def test_command_queues_interleaved_breakpoint_event() -> None:
                 "index": 404,
             },
         }]
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "java_runtime.jdwp.command.send" in messages
+        assert "java_runtime.jdwp.event.queued" in messages
+        assert "java_runtime.jdwp.command.reply" in messages
         thread.join(timeout=2)
         assert not thread.is_alive()
     finally:

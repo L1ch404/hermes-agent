@@ -4,12 +4,16 @@ Java process lifecycle manager — pure subprocess, no JDWP dependency.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import socket
 import subprocess
 import time
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProcessInfo:
@@ -105,8 +109,19 @@ class ProcessManager:
         (JDWP handshake verified + process survives 2s after). Raises
         RuntimeError with log tail on failure.
         """
+        started_at = time.monotonic()
+        logger.info(
+            "java_runtime.process.start.request main_class=%s classpath=%s "
+            "jdwp_port=%s app_args_count=%s vm_args_count=%s startup_timeout=%s",
+            main_class or "-", classpath, jdwp_port,
+            len(app_args or []), len(vm_args or []), startup_timeout,
+        )
         # Auto-restart: stop old process first
         if self._process and self._process.is_alive():
+            logger.info(
+                "java_runtime.process.start.replacing pid=%s",
+                self._process.pid,
+            )
             self.stop()
 
         log_fp = None
@@ -128,9 +143,19 @@ class ProcessManager:
                 cmd, stdout=log_fp or subprocess.DEVNULL, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        except Exception:
+            logger.info(
+                "java_runtime.process.spawned pid=%s main_class=%s jdwp_port=%s",
+                proc.pid, main_class or "-", jdwp_port,
+            )
+        except Exception as exc:
             if log_fp:
                 log_fp.close()
+            logger.error(
+                "java_runtime.process.spawn.failed main_class=%s jdwp_port=%s "
+                "error_type=%s error=%s",
+                main_class or "-", jdwp_port, type(exc).__name__,
+                str(exc).splitlines()[0] if str(exc) else "-",
+            )
             raise
 
         # Wait for process to confirm ready (JDWP handshake verified)
@@ -140,6 +165,12 @@ class ProcessManager:
                 if log_fp:
                     log_fp.close()
                 log_tail = self._read_log_tail(log_file)
+                logger.warning(
+                    "java_runtime.process.start.exited pid=%s exit_code=%s "
+                    "elapsed_ms=%.1f captured_log_chars=%s",
+                    proc.pid, proc.returncode,
+                    (time.monotonic() - started_at) * 1000, len(log_tail),
+                )
                 raise RuntimeError(
                     f"Process exited with code {proc.returncode}. "
                     f"Last log lines:\n{log_tail}"
@@ -152,6 +183,12 @@ class ProcessManager:
                     if log_fp:
                         log_fp.close()
                     log_tail = self._read_log_tail(log_file)
+                    logger.warning(
+                        "java_runtime.process.start.unstable pid=%s exit_code=%s "
+                        "elapsed_ms=%.1f captured_log_chars=%s",
+                        proc.pid, proc.returncode,
+                        (time.monotonic() - started_at) * 1000, len(log_tail),
+                    )
                     raise RuntimeError(
                         f"Process exited with code {proc.returncode} shortly after startup. "
                         f"Last log lines:\n{log_tail}"
@@ -168,6 +205,11 @@ class ProcessManager:
                 proc.kill()
             except Exception:
                 pass
+            logger.warning(
+                "java_runtime.process.start.timeout pid=%s jdwp_port=%s "
+                "timeout_seconds=%s captured_log_chars=%s",
+                proc.pid, jdwp_port, startup_timeout, len(log_tail),
+            )
             raise RuntimeError(
                 f"Startup timed out after {startup_timeout}s. "
                 f"Last log lines:\n{log_tail}"
@@ -176,6 +218,12 @@ class ProcessManager:
         if log_fp:
             log_fp.close()
         self._process = ProcessInfo(proc, jdwp_port, main_class)
+        logger.info(
+            "java_runtime.process.start.ready pid=%s main_class=%s jdwp_port=%s "
+            "elapsed_ms=%.1f log_file=%s",
+            proc.pid, main_class or "-", jdwp_port,
+            (time.monotonic() - started_at) * 1000, log_file or "-",
+        )
         return self._process
 
     def attach(
@@ -187,6 +235,10 @@ class ProcessManager:
     ) -> ProcessInfo:
         """Track an existing local JVM after verifying its process and JDWP port."""
         target_host = host or self._host
+        logger.info(
+            "java_runtime.process.attach.request pid=%s jdwp=%s:%s main_class=%s",
+            pid, target_host, jdwp_port, main_class or "-",
+        )
         if pid <= 0:
             raise RuntimeError("attach requires a positive pid")
         try:
@@ -205,19 +257,26 @@ class ProcessManager:
             pid=pid,
             owned=False,
         )
+        logger.info(
+            "java_runtime.process.attach.ready pid=%s jdwp=%s:%s main_class=%s",
+            pid, target_host, jdwp_port, main_class or "-",
+        )
         return self._process
 
     def detach(self) -> dict:
         """Forget an attached process without terminating it."""
         if self._process is None:
+            logger.info("java_runtime.process.detach.skipped reason=not_attached")
             return {"status": "not_attached"}
         pid = self._process.pid
         self._process = None
+        logger.info("java_runtime.process.detached pid=%s", pid)
         return {"status": "detached", "pid": pid}
 
     def stop(self) -> dict:
         """Stop the process. Returns {'status': ..., 'pid': ...}."""
         if self._process is None or not self._process.is_alive():
+            logger.info("java_runtime.process.stop.skipped reason=not_running")
             return {"status": "not_running"}
 
         if not self._process.owned:
@@ -228,9 +287,11 @@ class ProcessManager:
         if proc is None:
             return self.detach()
         try:
+            logger.info("java_runtime.process.stop.signal pid=%s signal=SIGTERM", pid)
             os.killpg(os.getpgid(pid), signal.SIGTERM)
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
+            logger.warning("java_runtime.process.stop.escalate pid=%s signal=SIGKILL", pid)
             try:
                 proc.kill()
                 proc.wait(timeout=3)
@@ -243,6 +304,10 @@ class ProcessManager:
                 pass
 
         self._process = None
+        logger.info(
+            "java_runtime.process.stop.finish pid=%s exit_code=%s",
+            pid, proc.poll(),
+        )
         return {"status": "stopped", "pid": pid}
 
     # -- query --
