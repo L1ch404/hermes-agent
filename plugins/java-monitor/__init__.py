@@ -370,7 +370,7 @@ def register(ctx) -> None:
     """Register the ``java_processes`` tool via the plugin context."""
     ctx.register_tool(
         name="java_processes",
-        toolset="java",
+        toolset="runtime",
         schema=JAVA_PROCESSES_SCHEMA,
         handler=_handle_java_processes,
         emoji="☕",

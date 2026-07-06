@@ -2,3 +2,5 @@ name: java-monitor
 version: 1.0.0
 description: "Monitor Java processes — check if a JVM is running, list Java processes with PID and main class."
 requires_env: []
+author: chenLi
+kind: backend

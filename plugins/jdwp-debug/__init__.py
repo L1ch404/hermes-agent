@@ -269,7 +269,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
 def register(ctx) -> None:
     ctx.register_tool(
         name="java_runtime",
-        toolset="java",
+        toolset="runtime",
         schema=JAVA_RUNTIME_SCHEMA,
         handler=_handle_java_runtime,
         emoji="☕",

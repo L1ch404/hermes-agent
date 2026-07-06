@@ -173,7 +173,7 @@ def register(ctx) -> None:
     """Register the ``call_http_api`` tool via the plugin context."""
     ctx.register_tool(
         name="call_http_api",
-        toolset="http",
+        toolset="runtime",
         schema=CALL_HTTP_API_SCHEMA,
         handler=_handle_call_http_api,
         emoji="🌐",

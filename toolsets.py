@@ -115,6 +115,13 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
+    "runtime":{
+        "includes": [],
+        "tools": ["java_runtime","java_processes","call_http_api"],
+        "description": (
+            "Manage and debug a Java application with stateful breakpoint observations"
+        )
+    },
     
     "vision": {
         "description": "Image analysis and vision tools",
