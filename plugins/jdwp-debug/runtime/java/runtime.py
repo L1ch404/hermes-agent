@@ -17,6 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ..base import (
@@ -65,44 +66,68 @@ class JavaRuntime(Runtime):
     # ── Lifecycle ──────────────────────────────────────
 
     def run(self, action: RuntimeAction) -> RuntimeResult:
+        launch_mode = "jar" if action.jar_path else "class"
         logger.info(
-            "java_runtime.jvm.run.request main_class=%s classpath=%s jdwp_port=%s "
+            "java_runtime.jvm.run.request launch_mode=%s main_class=%s jar_path=%s "
+            "classpath=%s jdwp_port=%s "
             "app_args_count=%s vm_args_count=%s",
+            launch_mode,
             action.main_class or "-",
+            action.jar_path or "-",
             action.classpath,
             action.jdwp_port,
             len(action.app_args or []),
             len(action.vm_args or []),
         )
+        if action.jar_path and action.main_class:
+            error = "Provide either jar_path or main_class, not both"
+            logger.warning("java_runtime.jvm.run.invalid error=%s", error)
+            return RuntimeResult(ok=False, error=error)
+        if not action.jar_path and not action.main_class:
+            error = "run requires either jar_path or main_class"
+            logger.warning("java_runtime.jvm.run.invalid error=%s", error)
+            return RuntimeResult(ok=False, error=error)
         try:
             self._reset_debug_state()
             self._host = "127.0.0.1"
-            log_file = self._log.create(action.main_class)
+            log_label = (
+                Path(action.jar_path).stem if action.jar_path
+                else action.main_class
+            )
+            log_file = self._log.create(log_label)
             info = self._proc.start(
                 classpath=action.classpath,
                 main_class=action.main_class,
+                jar_path=action.jar_path,
                 app_args=action.app_args,
                 jdwp_port=action.jdwp_port,
                 vm_args=action.vm_args,
                 log_file=log_file,
             )
-            result = RuntimeResult(ok=True, data={
+            data = {
                 "status": "started",
                 "pid": info.pid,
                 "jdwp_port": info.jdwp_port,
                 "log_file": log_file,
-                "main_class": info.main_class,
-            })
+                "launch_mode": info.launch_mode,
+            }
+            if info.launch_mode == "jar":
+                data["jar_path"] = info.jar_path
+            else:
+                data["main_class"] = info.main_class
+            result = RuntimeResult(ok=True, data=data)
             logger.info(
-                "java_runtime.jvm.run.ready pid=%s main_class=%s jdwp_port=%s log_file=%s",
-                info.pid, info.main_class, info.jdwp_port, log_file,
+                "java_runtime.jvm.run.ready pid=%s launch_mode=%s target=%s "
+                "jdwp_port=%s log_file=%s",
+                info.pid, info.launch_mode, info.jar_path or info.main_class,
+                info.jdwp_port, log_file,
             )
             return result
         except Exception as e:
             logger.error(
-                "java_runtime.jvm.run.failed main_class=%s jdwp_port=%s "
+                "java_runtime.jvm.run.failed launch_mode=%s target=%s jdwp_port=%s "
                 "error_type=%s error=%s",
-                action.main_class or "-", action.jdwp_port,
+                launch_mode, action.jar_path or action.main_class or "-", action.jdwp_port,
                 type(e).__name__, _error_summary(e),
             )
             return RuntimeResult(ok=False, error=str(e))
@@ -130,7 +155,11 @@ class JavaRuntime(Runtime):
         return RuntimeResult(ok=True, data=data)
 
     def restart(self, action: RuntimeAction) -> RuntimeResult:
-        logger.info("java_runtime.jvm.restart.request main_class=%s", action.main_class or "-")
+        logger.info(
+            "java_runtime.jvm.restart.request launch_mode=%s target=%s",
+            "jar" if action.jar_path else "class",
+            action.jar_path or action.main_class or "-",
+        )
         self.stop(action)
         time.sleep(1)
         return self.run(action)
@@ -251,7 +280,7 @@ class JavaRuntime(Runtime):
             "running": True,
             "pid": proc.pid,
             "jdwp_port": proc.jdwp_port,
-            "main_class": proc.main_class,
+            "launch_mode": proc.launch_mode,
             "ownership": "launched" if proc.owned else "attached",
             "log_file": self._log.path,
             "suspension_id": (
@@ -259,6 +288,10 @@ class JavaRuntime(Runtime):
                 if self._active_suspension is not None else None
             ),
         }
+        if proc.launch_mode == "jar":
+            info["jar_path"] = proc.jar_path
+        else:
+            info["main_class"] = proc.main_class
 
         # Try JDWP for extra info
         try:

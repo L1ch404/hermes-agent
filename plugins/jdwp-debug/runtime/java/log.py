@@ -43,7 +43,12 @@ class LogManager:
             logger.warning("java_runtime.console_log.tail.failed reason=no_log_file")
             return {"error": "No log file created"}
         try:
-            with open(self._current_file, "r") as f:
+            with open(
+                self._current_file,
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as f:
                 lines = f.readlines()
             result = {
                 "lines": lines[-n:] if n > 0 else lines,
@@ -56,9 +61,14 @@ class LogManager:
                 self._current_file, n, len(result["lines"]), len(lines),
             )
             return result
-        except FileNotFoundError:
+        except OSError as exc:
             logger.warning(
-                "java_runtime.console_log.tail.failed reason=not_found path=%s",
-                self._current_file,
+                "java_runtime.console_log.tail.failed path=%s error_type=%s error=%s",
+                self._current_file, type(exc).__name__, exc,
             )
-            return {"error": f"Log file not found: {self._current_file}"}
+            return {
+                "error": (
+                    f"Unable to read log file '{self._current_file}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            }

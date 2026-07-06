@@ -41,3 +41,19 @@ latency. It does not record protocol payloads. Runtime logs also omit variable
 values, application arguments, JVM argument values, and captured console text.
 The Java application's own console output remains in the `log_file` returned by
 the `run` action and is available through `java_runtime(action="logs")`.
+
+## Launching a Spring Boot executable JAR
+
+Use `jar_path` instead of overloading `classpath` or inventing a main class:
+
+```json
+{
+  "action": "run",
+  "jar_path": "C:\\work\\demo\\target\\demo.jar",
+  "app_args": ["--spring.profiles.active=local"],
+  "jdwp_port": 5005
+}
+```
+
+`jar_path` selects `java -jar` mode. `main_class` selects `java -cp` mode; the
+two fields are intentionally mutually exclusive.

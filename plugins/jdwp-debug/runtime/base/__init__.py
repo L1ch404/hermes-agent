@@ -60,6 +60,7 @@ class RuntimeAction:
     # lifecycle
     classpath: str = "."
     main_class: str = ""
+    jar_path: str = ""
     app_args: list[str] | None = None
     jdwp_port: int = 5005
     vm_args: list[str] | None = None

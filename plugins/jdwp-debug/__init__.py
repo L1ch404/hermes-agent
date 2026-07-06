@@ -54,11 +54,24 @@ JAVA_RUNTIME_SCHEMA = {
             },
             "classpath": {
                 "type": "string", "default": ".",
-                "description": "Classpath for the Java application. Default: '.'",
+                "description": (
+                    "Classpath used with main_class (java -cp). "
+                    "Ignored when jar_path is provided. Default: '.'"
+                ),
             },
             "main_class": {
                 "type": "string",
-                "description": "Fully-qualified main class name (e.g. 'DemoApp').",
+                "description": (
+                    "Fully-qualified main class for classpath mode (e.g. 'DemoApp'). "
+                    "Use either main_class or jar_path, not both."
+                ),
+            },
+            "jar_path": {
+                "type": "string",
+                "description": (
+                    "Executable JAR path for java -jar, including Spring Boot fat JARs. "
+                    "Use either jar_path or main_class, not both."
+                ),
             },
             "app_args": {
                 "type": "array", "items": {"type": "string"},
@@ -158,6 +171,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         action=args.get("action", "status"),
         classpath=args.get("classpath", "."),
         main_class=args.get("main_class", ""),
+        jar_path=args.get("jar_path", ""),
         app_args=args.get("app_args"),
         jdwp_port=args.get("jdwp_port", 5005),
         vm_args=args.get("vm_args"),
@@ -176,12 +190,13 @@ def _handle_java_runtime(args: dict, **kw) -> str:
     context_key = str(kw.get("session_id") or kw.get("task_id") or "default")
     rt = _get_runtime(context_key)
     logger.info(
-        "java_runtime.action.start action=%s context=%s pid=%s main_class=%s "
+        "java_runtime.action.start action=%s context=%s pid=%s main_class=%s jar_path=%s "
         "jdwp=%s:%s breakpoint=%s:%s suspension=%s",
         action.action,
         context_key,
         action.pid or "-",
         action.main_class or "-",
+        action.jar_path or "-",
         action.host,
         action.jdwp_port,
         action.class_pattern or "-",

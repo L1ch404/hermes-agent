@@ -12,8 +12,12 @@ import subprocess
 import time
 from typing import Optional
 
+import psutil
+
 
 logger = logging.getLogger(__name__)
+_IS_WINDOWS = os.name == "nt"
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
 
 
 class ProcessInfo:
@@ -24,6 +28,7 @@ class ProcessInfo:
         jdwp_port: int,
         main_class: str,
         *,
+        jar_path: str = "",
         pid: int | None = None,
         owned: bool = True,
     ):
@@ -31,6 +36,8 @@ class ProcessInfo:
         self._pid = proc.pid if proc is not None else int(pid or 0)
         self.jdwp_port = jdwp_port
         self.main_class = main_class
+        self.jar_path = jar_path
+        self.launch_mode = "jar" if jar_path else "class" if owned else "attached"
         self.owned = owned
 
     @property
@@ -42,11 +49,7 @@ class ProcessInfo:
             return self.proc.poll() is None
         if self._pid <= 0:
             return False
-        try:
-            os.kill(self._pid, 0)
-            return True
-        except OSError:
-            return False
+        return psutil.pid_exists(self._pid)
 
     @property
     def exit_code(self) -> int | None:
@@ -66,15 +69,19 @@ class ProcessManager:
 
     @staticmethod
     def _read_log_tail(log_file: str | None, n: int = 20) -> str:
-        """Read last N lines of a log file. Returns empty string on failure."""
+        """Read a UTF-8 log tail, returning a visible diagnostic on failure."""
         if not log_file:
-            return ""
+            return "[No log file configured]"
         try:
-            with open(log_file, "r") as f:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             return "".join(lines[-n:])
-        except Exception:
-            return ""
+        except OSError as exc:
+            logger.warning(
+                "java_runtime.process.log_tail.failed path=%s error_type=%s error=%s",
+                log_file, type(exc).__name__, exc,
+            )
+            return f"[Unable to read log file: {type(exc).__name__}: {exc}]"
 
     @staticmethod
     def _check_jdwp_port(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -97,6 +104,7 @@ class ProcessManager:
         classpath: str,
         main_class: str,
         *,
+        jar_path: str = "",
         app_args: list[str] | None = None,
         jdwp_port: int = 5005,
         vm_args: list[str] | None = None,
@@ -110,10 +118,17 @@ class ProcessManager:
         RuntimeError with log tail on failure.
         """
         started_at = time.monotonic()
+        launch_mode = "jar" if jar_path else "class"
+        if jar_path and main_class:
+            raise RuntimeError("Provide either jar_path or main_class, not both")
+        if not jar_path and not main_class:
+            raise RuntimeError("run requires either jar_path or main_class")
+
         logger.info(
-            "java_runtime.process.start.request main_class=%s classpath=%s "
+            "java_runtime.process.start.request launch_mode=%s main_class=%s "
+            "jar_path=%s classpath=%s "
             "jdwp_port=%s app_args_count=%s vm_args_count=%s startup_timeout=%s",
-            main_class or "-", classpath, jdwp_port,
+            launch_mode, main_class or "-", jar_path or "-", classpath, jdwp_port,
             len(app_args or []), len(vm_args or []), startup_timeout,
         )
         # Auto-restart: stop old process first
@@ -127,7 +142,9 @@ class ProcessManager:
         log_fp = None
         try:
             if log_file:
-                log_fp = open(log_file, "w")
+                # The Java child writes bytes directly to this file descriptor.
+                # Binary mode avoids applying the host's Windows text encoding.
+                log_fp = open(log_file, "wb")
 
             cmd = [
                 "java",
@@ -135,25 +152,36 @@ class ProcessManager:
             ]
             if vm_args:
                 cmd.extend(vm_args)
-            cmd.extend(["-cp", classpath, main_class])
+            if jar_path:
+                cmd.extend(["-jar", jar_path])
+            else:
+                cmd.extend(["-cp", classpath, main_class])
             if app_args:
                 cmd.extend(app_args)
 
+            popen_kwargs = {
+                "stdout": log_fp or subprocess.DEVNULL,
+                "stderr": subprocess.STDOUT,
+            }
+            if _IS_WINDOWS:
+                popen_kwargs["creationflags"] = _CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(
-                cmd, stdout=log_fp or subprocess.DEVNULL, stderr=subprocess.STDOUT,
-                start_new_session=True,
+                cmd,
+                **popen_kwargs,
             )
             logger.info(
-                "java_runtime.process.spawned pid=%s main_class=%s jdwp_port=%s",
-                proc.pid, main_class or "-", jdwp_port,
+                "java_runtime.process.spawned pid=%s launch_mode=%s target=%s jdwp_port=%s",
+                proc.pid, launch_mode, jar_path or main_class, jdwp_port,
             )
         except Exception as exc:
             if log_fp:
                 log_fp.close()
             logger.error(
-                "java_runtime.process.spawn.failed main_class=%s jdwp_port=%s "
+                "java_runtime.process.spawn.failed launch_mode=%s target=%s jdwp_port=%s "
                 "error_type=%s error=%s",
-                main_class or "-", jdwp_port, type(exc).__name__,
+                launch_mode, jar_path or main_class, jdwp_port, type(exc).__name__,
                 str(exc).splitlines()[0] if str(exc) else "-",
             )
             raise
@@ -217,11 +245,16 @@ class ProcessManager:
 
         if log_fp:
             log_fp.close()
-        self._process = ProcessInfo(proc, jdwp_port, main_class)
+        self._process = ProcessInfo(
+            proc,
+            jdwp_port,
+            main_class,
+            jar_path=jar_path,
+        )
         logger.info(
-            "java_runtime.process.start.ready pid=%s main_class=%s jdwp_port=%s "
+            "java_runtime.process.start.ready pid=%s launch_mode=%s target=%s jdwp_port=%s "
             "elapsed_ms=%.1f log_file=%s",
-            proc.pid, main_class or "-", jdwp_port,
+            proc.pid, launch_mode, jar_path or main_class, jdwp_port,
             (time.monotonic() - started_at) * 1000, log_file or "-",
         )
         return self._process
@@ -241,10 +274,8 @@ class ProcessManager:
         )
         if pid <= 0:
             raise RuntimeError("attach requires a positive pid")
-        try:
-            os.kill(pid, 0)
-        except OSError as exc:
-            raise RuntimeError(f"Java process {pid} is not running or not accessible") from exc
+        if not psutil.pid_exists(pid):
+            raise RuntimeError(f"Java process {pid} is not running")
         if not self._check_jdwp_port(target_host, jdwp_port, timeout=2.0):
             raise RuntimeError(
                 f"Process {pid} is running, but {target_host}:{jdwp_port} "
@@ -286,22 +317,10 @@ class ProcessManager:
         proc = self._process.proc
         if proc is None:
             return self.detach()
-        try:
-            logger.info("java_runtime.process.stop.signal pid=%s signal=SIGTERM", pid)
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            logger.warning("java_runtime.process.stop.escalate pid=%s signal=SIGKILL", pid)
-            try:
-                proc.kill()
-                proc.wait(timeout=3)
-            except Exception:
-                pass
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        if _IS_WINDOWS:
+            self._stop_windows(proc)
+        else:
+            self._stop_posix(proc)
 
         self._process = None
         logger.info(
@@ -309,6 +328,88 @@ class ProcessManager:
             pid, proc.poll(),
         )
         return {"status": "stopped", "pid": pid}
+
+    @staticmethod
+    def _stop_posix(proc: subprocess.Popen) -> None:
+        """Request graceful group shutdown, then escalate on POSIX."""
+        try:
+            logger.info(
+                "java_runtime.process.stop.signal pid=%s signal=SIGTERM",
+                proc.pid,
+            )
+            os.killpg(  # windows-footgun: ok — _stop_posix is never called on Windows
+                os.getpgid(proc.pid),
+                signal.SIGTERM,
+            )
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "java_runtime.process.stop.escalate pid=%s signal=SIGKILL",
+                proc.pid,
+            )
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError as exc:
+            logger.warning(
+                "java_runtime.process.stop.signal_failed pid=%s error=%s",
+                proc.pid, exc,
+            )
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _stop_windows(proc: subprocess.Popen) -> None:
+        """Request a Windows process-tree stop, then force it if needed."""
+        graceful = ["taskkill", "/PID", str(proc.pid), "/T"]
+        force = [*graceful, "/F"]
+        try:
+            logger.info(
+                "java_runtime.process.stop.signal pid=%s signal=taskkill_tree",
+                proc.pid,
+            )
+            result = subprocess.run(
+                graceful,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "java_runtime.process.stop.graceful_failed pid=%s returncode=%s",
+                    proc.pid, result.returncode,
+                )
+            proc.wait(timeout=3)
+            return
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            logger.warning(
+                "java_runtime.process.stop.escalate pid=%s signal=taskkill_tree_force",
+                proc.pid,
+            )
+
+        try:
+            subprocess.run(
+                force,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            proc.wait(timeout=3)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     # -- query --
 
