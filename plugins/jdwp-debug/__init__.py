@@ -33,6 +33,8 @@ JAVA_RUNTIME_SCHEMA = {
         "wait_breakpoint, inspect using the returned suspension_id, then resume. "
         "Use breakpoint bp_action=list to inspect active breakpoints and "
         "bp_action=remove with request_id to clear one breakpoint. "
+        "Use exception to set/list/remove exception events, then wait_event to "
+        "wait for either a breakpoint or exception suspension. "
         "Stack frames and variable/object references are valid only while that "
         "suspension is active. "
         "Variable entries use value_state=observed for real values (including "
@@ -49,11 +51,13 @@ JAVA_RUNTIME_SCHEMA = {
                 "type": "string",
                 "enum": [
                     "run", "stop", "restart", "attach", "detach", "status", "logs", "breakpoint",
-                    "wait_breakpoint", "threads", "stack", "variables", "resume",
+                    "exception", "wait_event", "wait_breakpoint", "threads", "stack", "variables", "resume",
                 ],
                 "description": (
-                    "Operation to perform. wait_breakpoint blocks until a hit or timeout; "
-                    "threads/stack/variables require an active breakpoint suspension; "
+                    "Operation to perform. wait_event blocks until a breakpoint or "
+                    "exception hit; wait_breakpoint is the compatibility form that "
+                    "only accepts breakpoint hits. threads/stack/variables require "
+                    "an active debug suspension; "
                     "resume invalidates that suspension."
                 ),
             },
@@ -116,8 +120,56 @@ JAVA_RUNTIME_SCHEMA = {
             "request_id": {
                 "type": "integer", "minimum": 1,
                 "description": (
-                    "Breakpoint request id returned by bp_action='set' or 'list'. "
-                    "Use it with bp_action='remove' to clear exactly one breakpoint."
+                    "Event request id returned by breakpoint or exception set/list. "
+                    "Use it with bp_action='remove' or exception_action='remove' "
+                    "to clear exactly one event request."
+                ),
+            },
+            "exception_action": {
+                "type": "string", "enum": ["set", "remove", "list"],
+                "description": (
+                    "Exception event operation for action='exception'. "
+                    "'set' requires exception_class and registers a JDWP exception "
+                    "event. 'list' returns tracked exception request_id values. "
+                    "'remove' prefers request_id; if no selector is provided, all "
+                    "exception event requests are cleared for backward compatibility."
+                ),
+            },
+            "exception_class": {
+                "type": "string",
+                "description": (
+                    "Exception class to watch for action='exception', accepted as "
+                    "java.lang.NullPointerException, java/lang/NullPointerException, "
+                    "or Ljava/lang/NullPointerException;. Runtime normalizes it to "
+                    "a JVM signature. Broad classes such as java.lang.Exception, "
+                    "java.lang.RuntimeException, java.lang.Error, and "
+                    "java.lang.Throwable are refused when caught=true unless "
+                    "allow_broad_caught=true is explicitly set."
+                ),
+            },
+            "caught": {
+                "type": "boolean", "default": True,
+                "description": (
+                    "For action='exception'. Whether to suspend when the exception "
+                    "will be caught. Defaults to true for specific exceptions such "
+                    "as NullPointerException because web frameworks often catch and "
+                    "wrap them. Broad caught exception watches are refused unless "
+                    "allow_broad_caught=true."
+                ),
+            },
+            "uncaught": {
+                "type": "boolean", "default": True,
+                "description": (
+                    "For action='exception'. Whether to suspend for uncaught throws. "
+                    "At least one of caught or uncaught must be true."
+                ),
+            },
+            "allow_broad_caught": {
+                "type": "boolean", "default": False,
+                "description": (
+                    "Safety override for action='exception'. Set true only when you "
+                    "intentionally want caught=true on a broad class such as "
+                    "java.lang.Exception; this can be very noisy in Spring/MyBatis/etc."
                 ),
             },
             "class_pattern": {
@@ -172,12 +224,12 @@ JAVA_RUNTIME_SCHEMA = {
             },
             "timeout": {
                 "type": "number", "minimum": 0.1, "maximum": 300, "default": 30,
-                "description": "Seconds to wait for a breakpoint event. Default: 30.",
+                "description": "Seconds to wait for a debug event. Default: 30.",
             },
             "suspension_id": {
                 "type": "string",
                 "description": (
-                    "Suspension token returned by wait_breakpoint. Pass it to "
+                    "Suspension token returned by wait_event or wait_breakpoint. Pass it to "
                     "threads, stack, variables, and resume so stale observations are rejected."
                 ),
             },
@@ -198,6 +250,15 @@ def _log_error_summary(error: str) -> str:
     if not error:
         return "-"
     return error.splitlines()[0][:240]
+
+
+def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
+    value = args.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def _get_runtime(context_key: str = "default") -> Runtime:
@@ -225,13 +286,18 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         host=args.get("host", "127.0.0.1"),
         tail=args.get("tail", 50),
         bp_action=args.get("bp_action", "set"),
+        exception_action=args.get("exception_action", "set"),
         request_id=args.get("request_id", 0),
         class_pattern=args.get("class_pattern", ""),
+        exception_class=args.get("exception_class", ""),
+        caught=_bool_arg(args, "caught", True),
+        uncaught=_bool_arg(args, "uncaught", True),
+        allow_broad_caught=_bool_arg(args, "allow_broad_caught", False),
         line=args.get("line", 0),
         thread_name=args.get("thread_name", ""),
         frame_index=args.get("frame_index", 0),
         max_frames=args.get("max_frames", 20),
-        include_this=args.get("include_this", False) is True,
+        include_this=_bool_arg(args, "include_this", False),
         max_value_depth=int(args.get("max_value_depth", 1)),
         timeout=float(args.get("timeout", 30)),
         suspension_id=args.get("suspension_id", ""),
@@ -240,7 +306,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
     rt = _get_runtime(context_key)
     logger.info(
         "java_runtime.action.start action=%s context=%s pid=%s main_class=%s jar_path=%s "
-        "jdwp=%s:%s breakpoint=%s:%s request_id=%s suspension=%s",
+        "jdwp=%s:%s breakpoint=%s:%s exception=%s request_id=%s suspension=%s",
         action.action,
         context_key,
         action.pid or "-",
@@ -250,6 +316,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         action.jdwp_port,
         action.class_pattern or "-",
         action.line or "-",
+        action.exception_class or "-",
         action.request_id or "-",
         action.suspension_id or "-",
     )
@@ -263,6 +330,8 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         "status": rt.status,
         "logs": rt.logs,
         "breakpoint": rt.breakpoint,
+        "exception": rt.exception,
+        "wait_event": rt.wait_event,
         "wait_breakpoint": rt.wait_breakpoint,
         "threads": rt.threads,
         "stack": rt.stack,

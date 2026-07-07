@@ -329,6 +329,51 @@ def test_command_queues_interleaved_breakpoint_event(caplog) -> None:
         vm_sock.close()
 
 
+def test_jdwp_parser_handles_exception_event() -> None:
+    client = JDWPClient()
+    client.ids = IDSizes(8, 8, 8, 8, 8)
+    event_data = struct.pack(">BI", 2, 1)
+    event_data += struct.pack(">BI", EventKind.EXCEPTION, 73)
+    event_data += (101).to_bytes(8, "big")
+    event_data += struct.pack(">B", 1)
+    event_data += (202).to_bytes(8, "big")
+    event_data += (303).to_bytes(8, "big")
+    event_data += struct.pack(">Q", 404)
+    event_data += bytes([Tag.OBJECT])
+    event_data += (505).to_bytes(8, "big")
+    event_data += struct.pack(">B", 1)
+    event_data += (606).to_bytes(8, "big")
+    event_data += (707).to_bytes(8, "big")
+    event_data += struct.pack(">Q", 808)
+
+    composite = client._parse_composite_event(event_data)
+
+    assert composite == {
+        "suspend_policy": 2,
+        "events": [{
+            "kind": EventKind.EXCEPTION,
+            "request_id": 73,
+            "thread_id": 101,
+            "location": {
+                "type_tag": 1,
+                "class_id": 202,
+                "method_id": 303,
+                "index": 404,
+            },
+            "exception": {
+                "tag": Tag.OBJECT,
+                "object_id": 505,
+            },
+            "catch_location": {
+                "type_tag": 1,
+                "class_id": 606,
+                "method_id": 707,
+                "index": 808,
+            },
+        }],
+    }
+
+
 def test_breakpoint_clear_includes_event_kind() -> None:
     class FakeProcessManager:
         is_running = True
@@ -459,6 +504,217 @@ def test_breakpoint_remove_by_class_and_line_filters_existing_breakpoints() -> N
     assert client.calls == [
         (Cmd.EVENT, 2, struct.pack(">BI", EventKind.BREAKPOINT, 23))
     ]
+
+
+def _pack_all_classes(*classes: tuple[int, int, str, int]) -> bytes:
+    payload = struct.pack(">I", len(classes))
+    for type_tag, class_id, signature, status in classes:
+        signature_bytes = signature.encode("utf-8")
+        payload += bytes([type_tag])
+        payload += class_id.to_bytes(8, "big")
+        payload += struct.pack(">I", len(signature_bytes))
+        payload += signature_bytes
+        payload += struct.pack(">I", status)
+    return payload
+
+
+def test_exception_class_names_are_normalized() -> None:
+    runtime = JavaRuntime()
+
+    for value in (
+        "java.lang.NullPointerException",
+        "java/lang/NullPointerException",
+        "Ljava/lang/NullPointerException;",
+        "Ljava.lang.NullPointerException;",
+        "NullPointerException",
+    ):
+        normalized, error = runtime._normalize_exception_signature(value)
+        assert error == ""
+        assert normalized == "Ljava/lang/NullPointerException;"
+
+
+def test_broad_caught_exception_watch_is_rejected_without_connecting() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: (_ for _ in ()).throw(AssertionError("should not connect"))
+
+    result = runtime.exception(RuntimeAction(
+        action="exception",
+        exception_class="java.lang.Exception",
+    ))
+
+    assert "Refusing broad caught exception watch" in result.error
+    assert "allow_broad_caught=true" in result.error
+
+
+def test_exception_set_builds_exception_only_request() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, command_set, command, data=b""):
+            self.calls.append((command_set, command, data))
+            if (command_set, command) == (Cmd.VM, 3):
+                return 0, _pack_all_classes(
+                    (1, 42, "Ljava/lang/NullPointerException;", 7),
+                )
+            if (command_set, command) == (Cmd.EVENT, 1):
+                return 0, struct.pack(">I", 91)
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    client = FakeClient()
+    runtime._connect = lambda: client
+
+    result = runtime.exception(RuntimeAction(
+        action="exception",
+        exception_class="java.lang.NullPointerException",
+    ))
+
+    expected_payload = struct.pack(">BBI", EventKind.EXCEPTION, 2, 1)
+    expected_payload += struct.pack(">B", 8)
+    expected_payload += (42).to_bytes(8, "big")
+    expected_payload += struct.pack(">BB", 1, 1)
+    assert result.error == ""
+    assert result.data == {
+        "exception_action": "set",
+        "request_id": 91,
+        "exception_class": "Ljava/lang/NullPointerException;",
+        "caught": True,
+        "uncaught": True,
+    }
+    assert client.calls == [
+        (Cmd.VM, 3, b""),
+        (Cmd.EVENT, 1, expected_payload),
+    ]
+    assert runtime._exceptions[91]["exception_class"] == "Ljava/lang/NullPointerException;"
+
+
+def test_exception_list_and_remove_by_request_id() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def command(self, command_set, command, data=b""):
+            self.calls.append((command_set, command, data))
+            return 0, b""
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._exceptions = {
+        91: {
+            "exception_class": "Ljava/lang/NullPointerException;",
+            "caught": True,
+            "uncaught": True,
+        },
+        92: {
+            "exception_class": "Ljava/lang/IllegalStateException;",
+            "caught": False,
+            "uncaught": True,
+        },
+    }
+    runtime._connect = lambda: (_ for _ in ()).throw(AssertionError("list should not connect"))
+
+    listed = runtime.exception(RuntimeAction(action="exception", exception_action="list"))
+
+    assert listed.error == ""
+    assert listed.data["exceptions"] == [
+        {
+            "request_id": 91,
+            "exception_class": "Ljava/lang/NullPointerException;",
+            "caught": True,
+            "uncaught": True,
+        },
+        {
+            "request_id": 92,
+            "exception_class": "Ljava/lang/IllegalStateException;",
+            "caught": False,
+            "uncaught": True,
+        },
+    ]
+
+    client = FakeClient()
+    runtime._connect = lambda: client
+    removed = runtime.exception(RuntimeAction(
+        action="exception",
+        exception_action="remove",
+        request_id=91,
+    ))
+
+    assert removed.error == ""
+    assert removed.data["cleared_ids"] == [91]
+    assert set(runtime._exceptions) == {92}
+    assert client.calls == [
+        (Cmd.EVENT, 2, struct.pack(">BI", EventKind.EXCEPTION, 91))
+    ]
+
+
+def test_wait_event_returns_exception_suspension() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        def wait_for_event(self, timeout):
+            return {
+                "suspend_policy": 2,
+                "events": [{
+                    "kind": EventKind.EXCEPTION,
+                    "request_id": 91,
+                    "thread_id": 10,
+                    "location": {"class_id": 20, "method_id": 30, "index": 40},
+                    "exception": {"tag": Tag.OBJECT, "object_id": 50},
+                    "catch_location": {"class_id": 21, "method_id": 31, "index": 41},
+                }],
+            }
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._exceptions = {
+        91: {
+            "exception_class": "Ljava/lang/NullPointerException;",
+            "caught": True,
+            "uncaught": True,
+        }
+    }
+    runtime._connect = lambda: FakeClient()
+    runtime._describe_location = lambda jdwp, location: {
+        "class": "LExample;",
+        "method": "run()V",
+        "line": 123,
+    }
+    runtime._thread_name = lambda jdwp, thread_id: "main"
+    runtime._object_class_signature = lambda jdwp, obj_id: "Ljava/lang/NullPointerException;"
+
+    result = runtime.wait_event(RuntimeAction(action="wait_event", timeout=1))
+
+    assert result.error == ""
+    assert result.data["status"] == "exception_hit"
+    assert result.data["event_kind"] == "exception"
+    assert result.data["exception"] == {
+        "request_id": 91,
+        "exception_class": "Ljava/lang/NullPointerException;",
+        "thrown_class": "Ljava/lang/NullPointerException;",
+        "value": {"_ref": "0x32", "_kind": "object"},
+        "caught": True,
+        "request_caught": True,
+        "request_uncaught": True,
+    }
+    assert result.data["location"]["line"] == 123
+    assert result.data["catch_location"]["line"] == 123
+    assert runtime._active_suspension is not None
+    assert runtime._active_suspension.event_kind == "exception"
 
 
 def _runtime_with_fake_variable_response(stack_error: int, stack_data: bytes):
@@ -775,6 +1031,95 @@ public class DebugFixture {
             suspension_id=suspension_id,
         ))
         assert "No active breakpoint suspension" in stale.error
+    finally:
+        runtime.stop(RuntimeAction(action="stop"))
+
+
+@pytest.mark.skipif(
+    shutil.which("java") is None or shutil.which("javac") is None,
+    reason="JDK is required for the real JDWP integration test",
+)
+def test_real_jvm_caught_exception_event_suspends_at_throw_line(tmp_path: Path) -> None:
+    source = """\
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class ExceptionFixture {
+    public static void main(String[] args) throws Exception {
+        Class.forName("java.lang.NullPointerException");
+        Path trigger = Path.of(args[0]);
+        while (!Files.exists(trigger)) {
+            Thread.sleep(20);
+        }
+        try {
+            String value = null;
+            value.equals("boom");
+        } catch (NullPointerException e) {
+            System.out.println("caught npe");
+            Thread.sleep(30000);
+        }
+    }
+}
+"""
+    source_path = tmp_path / "ExceptionFixture.java"
+    source_path.write_text(source, encoding="utf-8")
+    subprocess.run(
+        ["javac", "-g", str(source_path)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    throw_line = next(
+        index for index, line in enumerate(source.splitlines(), start=1)
+        if 'value.equals("boom")' in line
+    )
+    trigger = tmp_path / "trigger"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    runtime = JavaRuntime()
+    try:
+        started = runtime.run(RuntimeAction(
+            action="run",
+            classpath=str(tmp_path),
+            main_class="ExceptionFixture",
+            app_args=[str(trigger)],
+            jdwp_port=port,
+        ))
+        assert started.error == ""
+
+        exception = runtime.exception(RuntimeAction(
+            action="exception",
+            exception_class="java.lang.NullPointerException",
+        ))
+        assert exception.error == ""
+        assert exception.data["exception_class"] == "Ljava/lang/NullPointerException;"
+        assert exception.data["caught"] is True
+        assert exception.data["uncaught"] is True
+
+        trigger.write_text("go", encoding="utf-8")
+        hit = runtime.wait_event(RuntimeAction(
+            action="wait_event",
+            timeout=10,
+        ))
+
+        assert hit.error == ""
+        assert hit.data["status"] == "exception_hit"
+        assert hit.data["event_kind"] == "exception"
+        assert hit.data["exception"]["exception_class"] == "Ljava/lang/NullPointerException;"
+        assert hit.data["exception"]["thrown_class"] == "Ljava/lang/NullPointerException;"
+        assert hit.data["exception"]["caught"] is True
+        assert hit.data["location"]["class"] == "LExceptionFixture;"
+        assert hit.data["location"]["line"] == throw_line
+        assert hit.data["catch_location"] is not None
+
+        resumed = runtime.resume(RuntimeAction(
+            action="resume",
+            suspension_id=hit.data["suspension_id"],
+        ))
+        assert resumed.error == ""
     finally:
         runtime.stop(RuntimeAction(action="stop"))
 

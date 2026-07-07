@@ -47,17 +47,40 @@ class SuspensionSnapshot:
     thread_id: int
     location: dict[str, int]
     observed_at: str
+    event_kind: str = "breakpoint"
+    event: dict[str, Any] | None = None
     valid: bool = True
 
 
 class JavaRuntime(Runtime):
     """Agent-facing Java runtime. One instance manages one application."""
 
+    _BROAD_EXCEPTION_SIGNATURES = {
+        "Ljava/lang/Throwable;",
+        "Ljava/lang/Exception;",
+        "Ljava/lang/RuntimeException;",
+        "Ljava/lang/Error;",
+    }
+    _JAVA_LANG_SIMPLE_EXCEPTIONS = {
+        "ArithmeticException",
+        "ArrayIndexOutOfBoundsException",
+        "ClassCastException",
+        "Error",
+        "Exception",
+        "IllegalArgumentException",
+        "IllegalStateException",
+        "IndexOutOfBoundsException",
+        "NullPointerException",
+        "RuntimeException",
+        "Throwable",
+    }
+
     def __init__(self, host: str = "localhost"):
         self._host = host
         self._proc = ProcessManager(host)
         self._log = LogManager()
         self._breakpoints: dict[int, dict[str, Any]] = {}
+        self._exceptions: dict[int, dict[str, Any]] = {}
         self._jdwp: JDWPClient | None = None  # persistent debugger connection
         self._active_suspension: SuspensionSnapshot | None = None
         self._suspension_generation = 0
@@ -147,6 +170,7 @@ class JavaRuntime(Runtime):
         )
         self._disconnect()
         self._breakpoints.clear()
+        self._exceptions.clear()
         self._invalidate_suspension()
         data = self._proc.stop()
         logger.info(
@@ -232,6 +256,7 @@ class JavaRuntime(Runtime):
                 return RuntimeResult(ok=False, error=f"VM resume before detach failed: {e}")
         self._invalidate_suspension()
         self._breakpoints.clear()
+        self._exceptions.clear()
         self._disconnect()
         current = self._proc.current
         if current is not None and current.owned and current.is_alive():
@@ -285,6 +310,7 @@ class JavaRuntime(Runtime):
             "ownership": "launched" if proc.owned else "attached",
             "log_file": self._log.path,
             "breakpoint_count": len(self._breakpoints),
+            "exception_count": len(self._exceptions),
             "suspension_id": (
                 self._active_suspension.suspension_id
                 if self._active_suspension is not None else None
@@ -533,16 +559,187 @@ class JavaRuntime(Runtime):
             )
             return RuntimeResult(ok=False, error=str(e))
 
+    def exception(self, action: RuntimeAction) -> RuntimeResult:
+        if not self._proc.is_running:
+            return RuntimeResult(ok=False, error="No application running")
+
+        logger.info(
+            "java_runtime.exception.request operation=%s request_id=%s exception_class=%s "
+            "caught=%s uncaught=%s active_count=%s",
+            action.exception_action,
+            action.request_id or "-",
+            action.exception_class or "-",
+            action.caught,
+            action.uncaught,
+            len(self._exceptions),
+        )
+
+        try:
+            if action.exception_action == "list":
+                exceptions = self._exception_observations()
+                logger.info("java_runtime.exception.list count=%s", len(exceptions))
+                return RuntimeResult(ok=True, data={
+                    "exception_action": "list",
+                    "count": len(exceptions),
+                    "exceptions": exceptions,
+                })
+
+            if action.exception_action == "set":
+                normalized_class, validation_error = self._validated_exception_signature(action)
+                if validation_error:
+                    return RuntimeResult(ok=False, error=validation_error)
+
+                jdwp = self._connect()
+                found = self._find_loaded_class_by_signature(jdwp, normalized_class)
+                if found is None:
+                    return RuntimeResult(
+                        ok=False,
+                        error=(
+                            f"Exception class '{normalized_class}' is not loaded in the target VM; "
+                            "retry after the application has loaded it"
+                        ),
+                        data={"exception_class": normalized_class},
+                    )
+                _type_tag, class_id, _signature = found
+
+                # EventRequest/Set: eventKind=EXCEPTION, suspendPolicy=SUSPEND_ALL,
+                # modifiers=1. ExceptionOnly modifier: modKind=8, referenceTypeID,
+                # notifyCaught, notifyUncaught.
+                payload = struct.pack(">BBI", EventKind.EXCEPTION, 2, 1)
+                payload += struct.pack(">B", 8)
+                payload += jdwp.ids.pack_ref(class_id)
+                payload += struct.pack(">BB", int(action.caught), int(action.uncaught))
+
+                err, data = jdwp.command(Cmd.EVENT, 1, payload)
+                if err:
+                    return RuntimeResult(ok=False, error=f"Set exception event failed (err {err})")
+
+                request_id = struct.unpack_from(">I", data, 0)[0]
+                self._exceptions[request_id] = {
+                    "exception_class": normalized_class,
+                    "caught": action.caught,
+                    "uncaught": action.uncaught,
+                }
+                logger.info(
+                    "java_runtime.exception.set request_id=%s exception_class=%s caught=%s uncaught=%s",
+                    request_id, normalized_class, action.caught, action.uncaught,
+                )
+                return RuntimeResult(ok=True, data={
+                    "exception_action": "set",
+                    "request_id": request_id,
+                    "exception_class": normalized_class,
+                    "caught": action.caught,
+                    "uncaught": action.uncaught,
+                })
+
+            if action.exception_action == "remove":
+                if not self._exceptions:
+                    return RuntimeResult(ok=False, error="No exception events set")
+
+                target_ids = self._exception_remove_targets(action)
+                if not target_ids:
+                    return RuntimeResult(
+                        ok=False,
+                        error="No active exception events matched the remove selector",
+                        data={
+                            "exception_action": "remove",
+                            "selector": self._exception_selector(action),
+                            "exceptions": self._exception_observations(),
+                        },
+                    )
+
+                jdwp = self._connect()
+                removed = []
+                failed = []
+                for rid in target_ids:
+                    payload = struct.pack(">BI", EventKind.EXCEPTION, rid)
+                    err, _ = jdwp.command(Cmd.EVENT, 2, payload)
+                    if err == 0:
+                        self._exceptions.pop(rid, None)
+                        removed.append(rid)
+                    else:
+                        failed.append({
+                            "request_id": rid,
+                            "error": f"Clear exception event failed (err {err})",
+                        })
+
+                if not removed:
+                    return RuntimeResult(
+                        ok=False,
+                        error="Failed to clear any exception events",
+                        data={
+                            "exception_action": "remove",
+                            "selector": self._exception_selector(action),
+                            "failed": failed,
+                            "exceptions": self._exception_observations(),
+                        },
+                    )
+
+                logger.info(
+                    "java_runtime.exception.removed request_ids=%s failed=%s remaining=%s",
+                    removed, len(failed), len(self._exceptions),
+                )
+                return RuntimeResult(ok=True, data={
+                    "exception_action": "remove",
+                    "selector": self._exception_selector(action),
+                    "cleared_ids": removed,
+                    "failed": failed,
+                    "partial": bool(failed),
+                    "cleared_all": not action.request_id and not action.exception_class,
+                    "remaining": len(self._exceptions),
+                    "exceptions": self._exception_observations(),
+                })
+
+            return RuntimeResult(ok=False, error=f"Unknown exception_action: {action.exception_action}")
+
+        except JDWPError as e:
+            logger.warning(
+                "java_runtime.exception.failed operation=%s exception_class=%s error=%s",
+                action.exception_action, action.exception_class or "-", e,
+            )
+            return RuntimeResult(ok=False, error=str(e))
+
     def wait_breakpoint(self, action: RuntimeAction) -> RuntimeResult:
         if not self._proc.is_running:
             return RuntimeResult(ok=False, error="No application running")
         if not self._breakpoints:
             return RuntimeResult(ok=False, error="No breakpoints set")
+        return self._wait_debug_event(
+            action,
+            accepted_kinds={EventKind.BREAKPOINT},
+            wait_label="breakpoint",
+        )
+
+    def wait_event(self, action: RuntimeAction) -> RuntimeResult:
+        if not self._proc.is_running:
+            return RuntimeResult(ok=False, error="No application running")
+        accepted_kinds = set()
+        if self._breakpoints:
+            accepted_kinds.add(EventKind.BREAKPOINT)
+        if self._exceptions:
+            accepted_kinds.add(EventKind.EXCEPTION)
+        if not accepted_kinds:
+            return RuntimeResult(ok=False, error="No breakpoint or exception events set")
+        return self._wait_debug_event(
+            action,
+            accepted_kinds=accepted_kinds,
+            wait_label="debug_event",
+        )
+
+    def _wait_debug_event(
+        self,
+        action: RuntimeAction,
+        *,
+        accepted_kinds: set[int],
+        wait_label: str,
+    ) -> RuntimeResult:
         if self._active_suspension is not None:
             logger.info(
-                "java_runtime.breakpoint.wait.already_suspended suspension=%s generation=%s",
+                "java_runtime.%s.wait.already_suspended suspension=%s generation=%s event_kind=%s",
+                wait_label,
                 self._active_suspension.suspension_id,
                 self._active_suspension.generation,
+                self._active_suspension.event_kind,
             )
             return RuntimeResult(ok=True, data={
                 "status": "already_suspended",
@@ -551,18 +748,18 @@ class JavaRuntime(Runtime):
 
         try:
             logger.info(
-                "java_runtime.breakpoint.wait.start timeout_seconds=%s active_breakpoints=%s",
-                action.timeout, len(self._breakpoints),
+                "java_runtime.%s.wait.start timeout_seconds=%s active_breakpoints=%s active_exceptions=%s",
+                wait_label, action.timeout, len(self._breakpoints), len(self._exceptions),
             )
             jdwp = self._connect()
             deadline = time.monotonic() + max(action.timeout, 0.1)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return self._breakpoint_timeout(action.timeout)
+                    return self._debug_event_timeout(wait_label, action.timeout)
                 composite = jdwp.wait_for_event(remaining)
                 if composite is None:
-                    return self._breakpoint_timeout(action.timeout)
+                    return self._debug_event_timeout(wait_label, action.timeout)
                 for event in composite.get("events", []):
                     if event.get("kind") in {
                         EventKind.VM_DEATH, EventKind.VM_DISCONNECTED,
@@ -570,47 +767,18 @@ class JavaRuntime(Runtime):
                         self._invalidate_suspension()
                         return RuntimeResult(
                             ok=False,
-                            error="Target VM exited while waiting for breakpoint",
+                            error=f"Target VM exited while waiting for {wait_label}",
                         )
                     request_id = int(event.get("request_id", 0))
-                    if (
-                        event.get("kind") != EventKind.BREAKPOINT
-                        or request_id not in self._breakpoints
-                    ):
+                    event_kind = int(event.get("kind", 0))
+                    if event_kind not in accepted_kinds:
                         continue
-
-                    self._suspension_generation += 1
-                    snapshot = SuspensionSnapshot(
-                        suspension_id=f"susp_{uuid.uuid4().hex[:12]}",
-                        generation=self._suspension_generation,
-                        request_id=request_id,
-                        thread_id=int(event["thread_id"]),
-                        location=event.get("location") or {},
-                        observed_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                    self._active_suspension = snapshot
-                    location_description = self._describe_location(jdwp, snapshot.location)
-                    thread_name = self._thread_name(jdwp, snapshot.thread_id)
-                    logger.info(
-                        "java_runtime.breakpoint.hit suspension=%s generation=%s request_id=%s "
-                        "thread=%s class=%s method=%s line=%s",
-                        snapshot.suspension_id,
-                        snapshot.generation,
-                        request_id,
-                        thread_name,
-                        location_description.get("class", "-"),
-                        location_description.get("method", "-"),
-                        location_description.get("line", "-"),
-                    )
-                    return RuntimeResult(ok=True, data={
-                        "status": "breakpoint_hit",
-                        **self._snapshot_context(snapshot),
-                        "breakpoint": self._breakpoints[request_id],
-                        "thread": {"name": thread_name},
-                        "location": location_description,
-                    })
+                    if event_kind == EventKind.BREAKPOINT and request_id in self._breakpoints:
+                        return self._capture_breakpoint_event(jdwp, event)
+                    if event_kind == EventKind.EXCEPTION and request_id in self._exceptions:
+                        return self._capture_exception_event(jdwp, event)
         except (JDWPError, OSError) as e:
-            logger.warning("java_runtime.breakpoint.wait.failed error=%s", e)
+            logger.warning("java_runtime.%s.wait.failed error=%s", wait_label, e)
             return RuntimeResult(ok=False, error=str(e))
 
     def threads(self, action: RuntimeAction) -> RuntimeResult:
@@ -625,6 +793,7 @@ class JavaRuntime(Runtime):
                 row: dict[str, Any] = {
                     "name": self._thread_name(jdwp, thread_id),
                     "is_breakpoint_thread": thread_id == snapshot.thread_id,
+                    "is_suspension_thread": thread_id == snapshot.thread_id,
                 }
                 if err == 0 and len(status_data) >= 8:
                     thread_status, suspend_status = struct.unpack(">II", status_data[:8])
@@ -829,13 +998,115 @@ class JavaRuntime(Runtime):
 
     # ── Internal ───────────────────────────────────────
 
-    def _breakpoint_timeout(self, timeout: float) -> RuntimeResult:
+    def _capture_breakpoint_event(
+        self,
+        jdwp: JDWPClient,
+        event: dict[str, Any],
+    ) -> RuntimeResult:
+        request_id = int(event.get("request_id", 0))
+        self._suspension_generation += 1
+        snapshot = SuspensionSnapshot(
+            suspension_id=f"susp_{uuid.uuid4().hex[:12]}",
+            generation=self._suspension_generation,
+            request_id=request_id,
+            thread_id=int(event["thread_id"]),
+            location=event.get("location") or {},
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            event_kind="breakpoint",
+            event=event,
+        )
+        self._active_suspension = snapshot
+        location_description = self._describe_location(jdwp, snapshot.location)
+        thread_name = self._thread_name(jdwp, snapshot.thread_id)
         logger.info(
-            "java_runtime.breakpoint.wait.timeout timeout_seconds=%s process_running=%s",
-            timeout, self._proc.is_running,
+            "java_runtime.breakpoint.hit suspension=%s generation=%s request_id=%s "
+            "thread=%s class=%s method=%s line=%s",
+            snapshot.suspension_id,
+            snapshot.generation,
+            request_id,
+            thread_name,
+            location_description.get("class", "-"),
+            location_description.get("method", "-"),
+            location_description.get("line", "-"),
+        )
+        return RuntimeResult(ok=True, data={
+            "status": "breakpoint_hit",
+            **self._snapshot_context(snapshot),
+            "breakpoint": self._breakpoints[request_id],
+            "thread": {"name": thread_name},
+            "location": location_description,
+        })
+
+    def _capture_exception_event(
+        self,
+        jdwp: JDWPClient,
+        event: dict[str, Any],
+    ) -> RuntimeResult:
+        request_id = int(event.get("request_id", 0))
+        exception_request = self._exceptions[request_id]
+        self._suspension_generation += 1
+        snapshot = SuspensionSnapshot(
+            suspension_id=f"susp_{uuid.uuid4().hex[:12]}",
+            generation=self._suspension_generation,
+            request_id=request_id,
+            thread_id=int(event["thread_id"]),
+            location=event.get("location") or {},
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            event_kind="exception",
+            event=event,
+        )
+        self._active_suspension = snapshot
+
+        location_description = self._describe_location(jdwp, snapshot.location)
+        catch_location = event.get("catch_location") or {}
+        catch_description = (
+            None
+            if self._is_empty_location(catch_location)
+            else self._describe_location(jdwp, catch_location)
+        )
+        thread_name = self._thread_name(jdwp, snapshot.thread_id)
+        exception_object = event.get("exception") or {}
+        object_id = int(exception_object.get("object_id", 0) or 0)
+        thrown_class = self._object_class_signature(jdwp, object_id) if object_id else "unknown"
+        logger.info(
+            "java_runtime.exception.hit suspension=%s generation=%s request_id=%s "
+            "thread=%s exception_class=%s thrown_class=%s class=%s method=%s line=%s caught=%s",
+            snapshot.suspension_id,
+            snapshot.generation,
+            request_id,
+            thread_name,
+            exception_request.get("exception_class", "-"),
+            thrown_class,
+            location_description.get("class", "-"),
+            location_description.get("method", "-"),
+            location_description.get("line", "-"),
+            catch_description is not None,
+        )
+        return RuntimeResult(ok=True, data={
+            "status": "exception_hit",
+            **self._snapshot_context(snapshot),
+            "exception": {
+                "request_id": request_id,
+                "exception_class": exception_request.get("exception_class", ""),
+                "thrown_class": thrown_class,
+                "value": self._reference_value(object_id, "object") if object_id else None,
+                "caught": catch_description is not None,
+                "request_caught": exception_request.get("caught", False),
+                "request_uncaught": exception_request.get("uncaught", False),
+            },
+            "thread": {"name": thread_name},
+            "location": location_description,
+            "catch_location": catch_description,
+        })
+
+    def _debug_event_timeout(self, wait_label: str, timeout: float) -> RuntimeResult:
+        logger.info(
+            "java_runtime.%s.wait.timeout timeout_seconds=%s process_running=%s",
+            wait_label, timeout, self._proc.is_running,
         )
         return RuntimeResult(ok=True, data={
             "status": "timeout",
+            "wait": wait_label,
             "timeout_seconds": timeout,
             "process_state": "running",
             "debug_state": "attached",
@@ -844,6 +1115,7 @@ class JavaRuntime(Runtime):
     def _reset_debug_state(self) -> None:
         self._disconnect()
         self._breakpoints.clear()
+        self._exceptions.clear()
         self._invalidate_suspension()
 
     def _invalidate_suspension(self) -> None:
@@ -860,7 +1132,7 @@ class JavaRuntime(Runtime):
         snapshot = self._active_suspension
         if snapshot is None or not snapshot.valid:
             raise RuntimeError(
-                "No active breakpoint suspension. Call wait_breakpoint after triggering the breakpoint."
+                "No active breakpoint suspension. Call wait_breakpoint or wait_event after triggering the debug event."
             )
         if action.suspension_id and action.suspension_id != snapshot.suspension_id:
             raise RuntimeError(
@@ -880,6 +1152,7 @@ class JavaRuntime(Runtime):
             "valid_while_suspended": True,
             "process_state": "running",
             "debug_state": "suspended",
+            "event_kind": snapshot.event_kind,
         }
 
     def _variable_observation(self, variable: Variable) -> dict[str, Any]:
@@ -943,6 +1216,95 @@ class JavaRuntime(Runtime):
             if class_matches and line_matches:
                 targets.append(request_id)
         return targets
+
+    def _exception_observations(self) -> list[dict[str, Any]]:
+        return [
+            self._exception_observation(request_id, exception)
+            for request_id, exception in sorted(self._exceptions.items())
+        ]
+
+    def _exception_observation(
+        self,
+        request_id: int,
+        exception: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "exception_class": exception.get("exception_class", ""),
+            "caught": exception.get("caught", False),
+            "uncaught": exception.get("uncaught", False),
+        }
+
+    def _exception_selector(self, action: RuntimeAction) -> dict[str, Any]:
+        selector: dict[str, Any] = {}
+        if action.request_id:
+            selector["request_id"] = action.request_id
+        if action.exception_class:
+            normalized, error = self._normalize_exception_signature(action.exception_class)
+            selector["exception_class"] = action.exception_class if error else normalized
+        if not selector:
+            selector["all"] = True
+        return selector
+
+    def _exception_remove_targets(self, action: RuntimeAction) -> list[int]:
+        if action.request_id:
+            return [action.request_id] if action.request_id in self._exceptions else []
+        if not action.exception_class:
+            return list(self._exceptions)
+
+        normalized, error = self._normalize_exception_signature(action.exception_class)
+        if error:
+            return []
+        return [
+            request_id
+            for request_id, exception in self._exceptions.items()
+            if exception.get("exception_class") == normalized
+        ]
+
+    def _validated_exception_signature(
+        self,
+        action: RuntimeAction,
+    ) -> tuple[str, str]:
+        normalized, error = self._normalize_exception_signature(action.exception_class)
+        if error:
+            return "", error
+        if not action.caught and not action.uncaught:
+            return "", "At least one of caught or uncaught must be true"
+        if (
+            action.caught
+            and normalized in self._BROAD_EXCEPTION_SIGNATURES
+            and not action.allow_broad_caught
+        ):
+            return "", (
+                f"Refusing broad caught exception watch for {normalized}; "
+                "use a specific exception class or set allow_broad_caught=true."
+            )
+        return normalized, ""
+
+    def _normalize_exception_signature(self, exception_class: str) -> tuple[str, str]:
+        raw = (exception_class or "").strip()
+        if not raw:
+            return "", "exception_class is required"
+
+        candidate = raw
+        if candidate.startswith("L"):
+            candidate = candidate[1:]
+        if candidate.endswith(";"):
+            candidate = candidate[:-1]
+        candidate = candidate.replace(".", "/").strip("/")
+
+        if "/" not in candidate:
+            if candidate in self._JAVA_LANG_SIMPLE_EXCEPTIONS:
+                candidate = f"java/lang/{candidate}"
+            else:
+                return "", (
+                    f"Exception class '{raw}' is not fully qualified; use a name like "
+                    "java.lang.NullPointerException"
+                )
+
+        if not candidate:
+            return "", "exception_class is required"
+        return f"L{candidate};", ""
 
     def _value_depth(self, requested_depth: int) -> int:
         try:
@@ -1068,6 +1430,47 @@ class JavaRuntime(Runtime):
         length = struct.unpack_from(">I", data, 0)[0]
         return data[4:4 + length].decode("utf-8", errors="replace")
 
+    def _find_loaded_class_by_signature(
+        self,
+        jdwp: JDWPClient,
+        signature: str,
+    ) -> tuple[int, int, str] | None:
+        ids = jdwp.ids
+        err, data = jdwp.command(Cmd.VM, 3)  # AllClasses
+        if err:
+            raise JDWPError(err, "AllClasses failed")
+
+        count = struct.unpack_from(">I", data, 0)[0]
+        offset = 4
+        for _ in range(count):
+            type_tag = data[offset]
+            offset += 1
+            class_id = int.from_bytes(
+                data[offset:offset + ids.reference_type_id_size], "big"
+            )
+            offset += ids.reference_type_id_size
+            sig_len = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            loaded_signature = data[offset:offset + sig_len].decode(
+                "utf-8", errors="replace"
+            )
+            offset += sig_len
+            offset += 4  # status
+            if loaded_signature == signature:
+                return type_tag, class_id, loaded_signature
+        return None
+
+    def _object_class_signature(self, jdwp: JDWPClient, obj_id: int) -> str:
+        if not obj_id:
+            return "unknown"
+        err, data = jdwp.command(Cmd.OBJ_REF, 1, jdwp.ids.pack_obj(obj_id))
+        if err or len(data) < 1 + jdwp.ids.reference_type_id_size:
+            return "unknown"
+        ref_type_id = int.from_bytes(
+            data[1:1 + jdwp.ids.reference_type_id_size], "big"
+        )
+        return self._class_signature(jdwp, ref_type_id)
+
     def _method_name(self, jdwp: JDWPClient, class_id: int, method_id: int) -> str:
         ids = jdwp.ids
         err, data = jdwp.command(Cmd.REF_TYPE, 5, ids.pack_ref(class_id))
@@ -1105,6 +1508,14 @@ class JavaRuntime(Runtime):
                 jdwp, jdwp.ids, class_id, method_id, index
             ),
         }
+
+    def _is_empty_location(self, location: dict[str, int]) -> bool:
+        return (
+            int(location.get("type_tag", 0) or 0) == 0
+            and int(location.get("class_id", 0) or 0) == 0
+            and int(location.get("method_id", 0) or 0) == 0
+            and int(location.get("index", 0) or 0) == 0
+        )
 
     def _thread_status_name(self, status: int) -> str:
         return {

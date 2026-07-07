@@ -39,6 +39,8 @@ restart
 status
 logs
 breakpoint
+exception
+wait_event
 variables
 ```
 
@@ -50,6 +52,8 @@ variables
 * status：获取运行状态（是否启动、PID 等）
 * logs：获取控制台日志（Console Output）
 * breakpoint：断点相关（set/remove/list；remove 优先按 request_id 删除单个断点）
+* exception：异常事件相关（set/remove/list；默认用于具体异常，如 NullPointerException）
+* wait_event：等待断点或异常事件命中，并返回 suspension_id
 * variables：读取断点处变量值（默认跳过 this，并使用浅层对象展开）
 
 ---

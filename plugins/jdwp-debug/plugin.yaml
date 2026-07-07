@@ -1,6 +1,6 @@
 name: java-runtime
-version: 2.3.0
-description: "Java Runtime — Agent-facing JVM lifecycle and debug manager. Run, stop, restart, observe, and debug Java applications without exposing JDWP internals."
+version: 2.4.0
+description: "Java Runtime — Agent-facing JVM lifecycle and debug manager. Run, stop, restart, observe, and debug Java applications with breakpoint and exception events without exposing JDWP internals."
 requires_env: []
 author: chenLi
 kind: backend

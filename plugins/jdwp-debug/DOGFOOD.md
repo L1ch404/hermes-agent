@@ -14,6 +14,7 @@ Useful event names include:
 - `java_runtime.process.*`: JVM spawn, readiness, exit, timeout, and shutdown.
 - `java_runtime.jdwp.connect.*`: debugger connection and negotiated ID sizes.
 - `java_runtime.breakpoint.*`: breakpoint creation, wait, timeout, and hit.
+- `java_runtime.exception.*`: exception event creation, removal, wait, and hit.
 - `java_runtime.suspension.*`: suspension invalidation and resume.
 - `java_runtime.threads.observed`, `java_runtime.stack.observed`, and
   `java_runtime.variables.observed`: observation counts and completeness.
@@ -80,3 +81,50 @@ backward compatibility.
 beans often expand into a huge dependency graph. Use `include_this=true` only
 when the receiver object is important. Use `max_value_depth` to control object
 expansion depth; the default is `1`.
+
+## Exception events
+
+Use exception events when an API returns a vague framework error and you need
+the exact throw location:
+
+```json
+{
+  "action": "exception",
+  "exception_class": "java.lang.NullPointerException"
+}
+```
+
+`exception_class` is normalized internally, so these forms are equivalent:
+
+- `java.lang.NullPointerException`
+- `java/lang/NullPointerException`
+- `Ljava/lang/NullPointerException;`
+
+Then wait for either a line breakpoint or exception event:
+
+```json
+{"action": "wait_event", "timeout": 30}
+```
+
+Specific exceptions default to `caught=true` and `uncaught=true`, because Spring
+and similar frameworks often catch the real exception and wrap it into a generic
+API response. Broad caught exception watches are refused by default:
+
+```json
+{
+  "action": "exception",
+  "exception_class": "java.lang.Exception",
+  "caught": true
+}
+```
+
+That request can be extremely noisy in Spring/MyBatis/etc. Use a specific
+exception class instead. If you intentionally need it, pass
+`allow_broad_caught=true`.
+
+List and remove exception events the same way as breakpoints:
+
+```json
+{"action": "exception", "exception_action": "list"}
+{"action": "exception", "exception_action": "remove", "request_id": 1081}
+```

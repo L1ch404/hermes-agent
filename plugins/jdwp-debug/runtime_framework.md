@@ -195,10 +195,14 @@ logs
 
 breakpoint
 
+exception
+
+wait_event
+
 variables
 ```
 
-不要继续增加新的能力。
+先不要继续增加更大的能力；exception / wait_event 属于 debug loop 内部的事件类型扩展。
 
 重点先把 Runtime Framework 做稳定。
 

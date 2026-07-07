@@ -72,8 +72,13 @@ class RuntimeAction:
 
     # debug
     bp_action: str = "set"
+    exception_action: str = "set"
     request_id: int = 0
     class_pattern: str = ""
+    exception_class: str = ""
+    caught: bool = True
+    uncaught: bool = True
+    allow_broad_caught: bool = False
     line: int = 0
     thread_name: str = ""
     frame_index: int = 0
@@ -151,7 +156,15 @@ class Runtime(ABC):
         ...
 
     @abstractmethod
+    def exception(self, action: RuntimeAction) -> RuntimeResult:
+        ...
+
+    @abstractmethod
     def wait_breakpoint(self, action: RuntimeAction) -> RuntimeResult:
+        ...
+
+    @abstractmethod
+    def wait_event(self, action: RuntimeAction) -> RuntimeResult:
         ...
 
     @abstractmethod

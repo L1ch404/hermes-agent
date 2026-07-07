@@ -76,6 +76,7 @@ class Cmd:
 class EventKind:
     SINGLE_STEP = 1
     BREAKPOINT = 2
+    EXCEPTION = 4
     THREAD_START = 6
     THREAD_DEATH = 7
     CLASS_PREPARE = 8
@@ -261,6 +262,18 @@ class JDWPClient:
             "index": index,
         }, offset
 
+    def _parse_tagged_object(self, data: bytes, offset: int) -> tuple[dict, int]:
+        ids = self.ids
+        if ids is None:
+            raise JDWPError(-1, "ID sizes have not been negotiated")
+        tag = data[offset]
+        offset += 1
+        object_id = int.from_bytes(
+            data[offset:offset + ids.object_id_size], "big"
+        )
+        offset += ids.object_id_size
+        return {"tag": tag, "object_id": object_id}, offset
+
     def _parse_composite_event(self, data: bytes) -> dict:
         """Parse Event/Composite data (the 11-byte JDWP header is excluded)."""
         ids = self.ids
@@ -287,6 +300,14 @@ class JDWPClient:
                 )
                 offset += ids.object_id_size
                 event["location"], offset = self._parse_location(data, offset)
+            elif kind == EventKind.EXCEPTION:
+                event["thread_id"] = int.from_bytes(
+                    data[offset:offset + ids.object_id_size], "big"
+                )
+                offset += ids.object_id_size
+                event["location"], offset = self._parse_location(data, offset)
+                event["exception"], offset = self._parse_tagged_object(data, offset)
+                event["catch_location"], offset = self._parse_location(data, offset)
             elif kind in {
                 EventKind.THREAD_START,
                 EventKind.THREAD_DEATH,
@@ -299,9 +320,8 @@ class JDWPClient:
             elif kind in {EventKind.VM_DEATH, EventKind.VM_DISCONNECTED}:
                 pass
             else:
-                # Hermes currently requests breakpoint events only.  Unknown
-                # event bodies have kind-specific lengths, so continuing would
-                # risk inventing boundaries for later events.
+                # Unknown event bodies have kind-specific lengths, so
+                # continuing would risk inventing boundaries for later events.
                 event["unparsed"] = True
                 event["raw_tail"] = data[offset:]
                 events.append(event)
