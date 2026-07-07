@@ -62,6 +62,7 @@ class JavaRuntime(Runtime):
         self._active_suspension: SuspensionSnapshot | None = None
         self._suspension_generation = 0
         self._max_array_elements = 64
+        self._max_value_depth = 5
 
     # ── Lifecycle ──────────────────────────────────────
 
@@ -283,6 +284,7 @@ class JavaRuntime(Runtime):
             "launch_mode": proc.launch_mode,
             "ownership": "launched" if proc.owned else "attached",
             "log_file": self._log.path,
+            "breakpoint_count": len(self._breakpoints),
             "suspension_id": (
                 self._active_suspension.suspension_id
                 if self._active_suspension is not None else None
@@ -329,11 +331,23 @@ class JavaRuntime(Runtime):
             return RuntimeResult(ok=False, error="No application running")
 
         logger.info(
-            "java_runtime.breakpoint.request operation=%s class_pattern=%s line=%s active_count=%s",
-            action.bp_action, action.class_pattern or "-", action.line or "-",
+            "java_runtime.breakpoint.request operation=%s request_id=%s class_pattern=%s line=%s active_count=%s",
+            action.bp_action, action.request_id or "-", action.class_pattern or "-", action.line or "-",
             len(self._breakpoints),
         )
         try:
+            if action.bp_action == "list":
+                breakpoints = self._breakpoint_observations()
+                logger.info(
+                    "java_runtime.breakpoint.list count=%s",
+                    len(breakpoints),
+                )
+                return RuntimeResult(ok=True, data={
+                    "bp_action": "list",
+                    "count": len(breakpoints),
+                    "breakpoints": breakpoints,
+                })
+
             jdwp = self._connect()
 
             if action.bp_action == "set":
@@ -456,22 +470,58 @@ class JavaRuntime(Runtime):
                 if not self._breakpoints:
                     return RuntimeResult(ok=False, error="No breakpoints set")
 
+                target_ids = self._breakpoint_remove_targets(action)
+                if not target_ids:
+                    return RuntimeResult(
+                        ok=False,
+                        error="No active breakpoints matched the remove selector",
+                        data={
+                            "bp_action": "remove",
+                            "selector": self._breakpoint_selector(action),
+                            "breakpoints": self._breakpoint_observations(),
+                        },
+                    )
+
                 removed = []
-                for rid in list(self._breakpoints):
+                failed = []
+                for rid in target_ids:
                     # EventRequest/Clear: eventKind (BREAKPOINT) + requestID.
                     payload = struct.pack(">BI", EventKind.BREAKPOINT, rid)
                     err, _ = jdwp.command(Cmd.EVENT, 2, payload)
                     if err == 0:
                         self._breakpoints.pop(rid, None)
                         removed.append(rid)
+                    else:
+                        failed.append({
+                            "request_id": rid,
+                            "error": f"Clear breakpoint failed (err {err})",
+                        })
 
                 if not removed:
-                    return RuntimeResult(ok=False, error="Failed to clear any breakpoints")
+                    return RuntimeResult(
+                        ok=False,
+                        error="Failed to clear any breakpoints",
+                        data={
+                            "bp_action": "remove",
+                            "selector": self._breakpoint_selector(action),
+                            "failed": failed,
+                            "breakpoints": self._breakpoint_observations(),
+                        },
+                    )
                 logger.info(
-                    "java_runtime.breakpoint.removed request_ids=%s remaining=%s",
-                    removed, len(self._breakpoints),
+                    "java_runtime.breakpoint.removed request_ids=%s failed=%s remaining=%s",
+                    removed, len(failed), len(self._breakpoints),
                 )
-                return RuntimeResult(ok=True, data={"bp_action": "remove", "cleared_ids": removed})
+                return RuntimeResult(ok=True, data={
+                    "bp_action": "remove",
+                    "selector": self._breakpoint_selector(action),
+                    "cleared_ids": removed,
+                    "failed": failed,
+                    "partial": bool(failed),
+                    "cleared_all": not action.request_id and not action.class_pattern and not action.line,
+                    "remaining": len(self._breakpoints),
+                    "breakpoints": self._breakpoint_observations(),
+                })
 
             else:
                 return RuntimeResult(ok=False, error=f"Unknown bp_action: {action.bp_action}")
@@ -654,6 +704,23 @@ class JavaRuntime(Runtime):
             variables = self._visible_variables_for_location(
                 variable_data, frame["location_index"]
             )
+            skipped_variables: list[dict[str, Any]] = []
+            if not action.include_this:
+                kept_variables: list[Variable] = []
+                for variable in variables:
+                    if variable.name == "this":
+                        skipped_variables.append({
+                            "name": variable.name,
+                            "type": variable.type_name,
+                            "slot": variable.slot,
+                            "reason": "excluded_by_default",
+                            "hint": "Pass include_this=true to inspect the receiver object.",
+                        })
+                    else:
+                        kept_variables.append(variable)
+                variables = kept_variables
+
+            value_depth = self._value_depth(action.max_value_depth)
 
             getvalues_error = None
             if variables:
@@ -671,7 +738,9 @@ class JavaRuntime(Runtime):
                             tag = values_data[offset]
                             offset += 1
                             variables[index].value, offset = self._read_value(
-                                jdwp, ids, tag, values_data, offset, visited=set()
+                                jdwp, ids, tag, values_data, offset,
+                                depth=value_depth,
+                                visited=set(),
                             )
                             variables[index].value_observed = True
                         except Exception as exc:
@@ -705,14 +774,18 @@ class JavaRuntime(Runtime):
             unavailable_count = len(variables) - observed_count
             logger.info(
                 "java_runtime.variables.observed suspension=%s thread=%s frame_index=%s "
-                "total=%s observed=%s unavailable=%s complete=%s",
+                "total=%s skipped=%s observed=%s unavailable=%s complete=%s "
+                "include_this=%s max_value_depth=%s",
                 snapshot.suspension_id,
                 self._thread_name(jdwp, thread_id),
                 action.frame_index,
                 len(variables),
+                len(skipped_variables),
                 observed_count,
                 unavailable_count,
                 complete,
+                action.include_this,
+                value_depth,
             )
 
             return RuntimeResult(ok=True, data={
@@ -720,9 +793,13 @@ class JavaRuntime(Runtime):
                 "thread": {"name": self._thread_name(jdwp, thread_id)},
                 "frame": self._public_frame(frame),
                 "variable_count": len(variables),
+                "skipped_variable_count": len(skipped_variables),
                 "complete": complete,
                 "partial": not complete,
                 "variables": variable_results,
+                "skipped_variables": skipped_variables,
+                "include_this": action.include_this,
+                "max_value_depth": value_depth,
                 "getvalues_error": getvalues_error,
             })
         except (JDWPError, RuntimeError) as e:
@@ -818,6 +895,61 @@ class JavaRuntime(Runtime):
             result["value_state"] = "unavailable"
             result["error"] = variable.error or "Variable value was not returned by the JVM"
         return result
+
+    def _breakpoint_observations(self) -> list[dict[str, Any]]:
+        return [
+            self._breakpoint_observation(request_id, breakpoint)
+            for request_id, breakpoint in sorted(self._breakpoints.items())
+        ]
+
+    def _breakpoint_observation(
+        self,
+        request_id: int,
+        breakpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "class": breakpoint.get("class", ""),
+            "method": breakpoint.get("method", ""),
+            "line": breakpoint.get("line", 0),
+        }
+
+    def _breakpoint_selector(self, action: RuntimeAction) -> dict[str, Any]:
+        selector: dict[str, Any] = {}
+        if action.request_id:
+            selector["request_id"] = action.request_id
+        if action.class_pattern:
+            selector["class_pattern"] = action.class_pattern
+        if action.line:
+            selector["line"] = action.line
+        if not selector:
+            selector["all"] = True
+        return selector
+
+    def _breakpoint_remove_targets(self, action: RuntimeAction) -> list[int]:
+        if action.request_id:
+            return [action.request_id] if action.request_id in self._breakpoints else []
+        if not action.class_pattern and not action.line:
+            return list(self._breakpoints)
+
+        class_pattern = action.class_pattern.lower()
+        targets: list[int] = []
+        for request_id, breakpoint in self._breakpoints.items():
+            class_matches = (
+                not class_pattern
+                or class_pattern in str(breakpoint.get("class", "")).lower()
+            )
+            line_matches = not action.line or breakpoint.get("line") == action.line
+            if class_matches and line_matches:
+                targets.append(request_id)
+        return targets
+
+    def _value_depth(self, requested_depth: int) -> int:
+        try:
+            depth = int(requested_depth)
+        except (TypeError, ValueError):
+            depth = 1
+        return max(0, min(depth, self._max_value_depth))
 
     def _all_thread_ids(self, jdwp: JDWPClient) -> list[int]:
         ids = jdwp.ids

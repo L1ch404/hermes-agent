@@ -72,11 +72,14 @@ class RuntimeAction:
 
     # debug
     bp_action: str = "set"
+    request_id: int = 0
     class_pattern: str = ""
     line: int = 0
     thread_name: str = ""
     frame_index: int = 0
     max_frames: int = 20
+    include_this: bool = False
+    max_value_depth: int = 1
     timeout: float = 30.0
     suspension_id: str = ""
 

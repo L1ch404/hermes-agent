@@ -31,10 +31,15 @@ JAVA_RUNTIME_SCHEMA = {
         "and a stateful debug loop (breakpoint/wait/threads/stack/variables/resume). "
         "Debug workflow: set a breakpoint, trigger the application, call "
         "wait_breakpoint, inspect using the returned suspension_id, then resume. "
+        "Use breakpoint bp_action=list to inspect active breakpoints and "
+        "bp_action=remove with request_id to clear one breakpoint. "
         "Stack frames and variable/object references are valid only while that "
         "suspension is active. "
         "Variable entries use value_state=observed for real values (including "
         "Java null) and value_state=unavailable with an error when reading failed. "
+        "variables excludes the local variable named 'this' by default and uses "
+        "shallow object expansion so Spring beans do not flood the result; pass "
+        "include_this=true or increase max_value_depth when deeper inspection is needed. "
         "The LLM does not need to know about JDWP or any protocol internals."
     ),
     "parameters": {
@@ -98,18 +103,40 @@ JAVA_RUNTIME_SCHEMA = {
                 "description": "Lines of log output. Default: 50.",
             },
             "bp_action": {
-                "type": "string", "enum": ["set", "remove"],
-                "description": "Breakpoint operation: 'set' or 'remove'.",
+                "type": "string", "enum": ["set", "remove", "list"],
+                "description": (
+                    "Breakpoint operation for action='breakpoint'. "
+                    "'set' requires class_pattern and line. "
+                    "'list' returns currently tracked breakpoint request_id values. "
+                    "'remove' prefers request_id; if request_id is omitted, "
+                    "class_pattern and/or line are used as selectors; if no selector "
+                    "is provided, all breakpoints are cleared for backward compatibility."
+                ),
+            },
+            "request_id": {
+                "type": "integer", "minimum": 1,
+                "description": (
+                    "Breakpoint request id returned by bp_action='set' or 'list'. "
+                    "Use it with bp_action='remove' to clear exactly one breakpoint."
+                ),
             },
             "class_pattern": {
                 "type": "string",
-                "description": "Substring match against the JVM internal class signature (e.g. Lcom/foo/Bar;)."
-                               " To avoid matching CGLIB proxies, "
-                               "include enough path context like foo/Bar;.",
+                "description": (
+                    "Substring match against the JVM internal class signature "
+                    "(e.g. Lcom/foo/Bar;). For bp_action='set', this selects the "
+                    "target class. For bp_action='remove' without request_id, this "
+                    "filters active breakpoints by class. To avoid matching CGLIB "
+                    "proxies, include enough path context like foo/Bar;."
+                ),
             },
             "line": {
                 "type": "integer", "minimum": 1,
-                "description": "Source line number.",
+                "description": (
+                    "Source line number. For bp_action='set', this selects the target "
+                    "line. For bp_action='remove' without request_id, this filters "
+                    "active breakpoints by line."
+                ),
             },
             "thread_name": {
                 "type": "string",
@@ -125,6 +152,23 @@ JAVA_RUNTIME_SCHEMA = {
             "max_frames": {
                 "type": "integer", "minimum": 1, "maximum": 100, "default": 20,
                 "description": "Maximum frames returned by stack. Default: 20.",
+            },
+            "include_this": {
+                "type": "boolean", "default": False,
+                "description": (
+                    "Used by action='variables'. Defaults to false to skip the local "
+                    "variable named 'this', which is often a huge Spring bean graph. "
+                    "Set true only when the receiver object itself is important."
+                ),
+            },
+            "max_value_depth": {
+                "type": "integer", "minimum": 0, "maximum": 5, "default": 1,
+                "description": (
+                    "Used by action='variables'. Object expansion depth. Default 1 "
+                    "shows useful top-level fields without dumping deep dependency "
+                    "graphs. 0 keeps object values as references; primitives, strings, "
+                    "and array metadata remain readable."
+                ),
             },
             "timeout": {
                 "type": "number", "minimum": 0.1, "maximum": 300, "default": 30,
@@ -181,11 +225,14 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         host=args.get("host", "127.0.0.1"),
         tail=args.get("tail", 50),
         bp_action=args.get("bp_action", "set"),
+        request_id=args.get("request_id", 0),
         class_pattern=args.get("class_pattern", ""),
         line=args.get("line", 0),
         thread_name=args.get("thread_name", ""),
         frame_index=args.get("frame_index", 0),
         max_frames=args.get("max_frames", 20),
+        include_this=args.get("include_this", False) is True,
+        max_value_depth=int(args.get("max_value_depth", 1)),
         timeout=float(args.get("timeout", 30)),
         suspension_id=args.get("suspension_id", ""),
     )
@@ -193,7 +240,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
     rt = _get_runtime(context_key)
     logger.info(
         "java_runtime.action.start action=%s context=%s pid=%s main_class=%s jar_path=%s "
-        "jdwp=%s:%s breakpoint=%s:%s suspension=%s",
+        "jdwp=%s:%s breakpoint=%s:%s request_id=%s suspension=%s",
         action.action,
         context_key,
         action.pid or "-",
@@ -203,6 +250,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         action.jdwp_port,
         action.class_pattern or "-",
         action.line or "-",
+        action.request_id or "-",
         action.suspension_id or "-",
     )
 

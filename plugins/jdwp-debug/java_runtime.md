@@ -49,8 +49,8 @@ variables
 * restart：重启应用
 * status：获取运行状态（是否启动、PID 等）
 * logs：获取控制台日志（Console Output）
-* breakpoint：断点相关（先支持 set/remove 即可）
-* variables：读取断点处变量值
+* breakpoint：断点相关（set/remove/list；remove 优先按 request_id 删除单个断点）
+* variables：读取断点处变量值（默认跳过 this，并使用浅层对象展开）
 
 ---
 

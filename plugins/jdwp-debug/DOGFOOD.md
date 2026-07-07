@@ -57,3 +57,26 @@ Use `jar_path` instead of overloading `classpath` or inventing a main class:
 
 `jar_path` selects `java -jar` mode. `main_class` selects `java -cp` mode; the
 two fields are intentionally mutually exclusive.
+
+## Breakpoint and variable inspection tips
+
+List active breakpoints before or after `resume`:
+
+```json
+{"action": "breakpoint", "bp_action": "list"}
+```
+
+Remove one breakpoint by the `request_id` returned from `set` or `list`:
+
+```json
+{"action": "breakpoint", "bp_action": "remove", "request_id": 1081}
+```
+
+If `request_id` is unavailable, `remove` can filter by `class_pattern` and/or
+`line`. Calling `remove` with no selector still clears all breakpoints for
+backward compatibility.
+
+`variables` skips the local variable named `this` by default because Spring
+beans often expand into a huge dependency graph. Use `include_this=true` only
+when the receiver object is important. Use `max_value_depth` to control object
+expansion depth; the default is `1`.

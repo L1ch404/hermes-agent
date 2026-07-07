@@ -355,6 +355,112 @@ def test_breakpoint_clear_includes_event_kind() -> None:
     ]
 
 
+def test_breakpoint_list_returns_request_ids_without_protocol_call() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._breakpoints = {
+        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
+        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
+    }
+    runtime._connect = lambda: (_ for _ in ()).throw(AssertionError("list should not connect"))
+
+    result = runtime.breakpoint(RuntimeAction(action="breakpoint", bp_action="list"))
+
+    assert result.error == ""
+    assert result.data["bp_action"] == "list"
+    assert result.data["count"] == 2
+    assert result.data["breakpoints"] == [
+        {
+            "request_id": 17,
+            "class": "Lcom/example/Foo;",
+            "method": "run()V",
+            "line": 10,
+        },
+        {
+            "request_id": 23,
+            "class": "Lcom/example/Bar;",
+            "method": "handle()V",
+            "line": 20,
+        },
+    ]
+
+
+def test_breakpoint_remove_by_request_id_only_clears_that_breakpoint() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def command(self, command_set, command, data=b""):
+            self.calls.append((command_set, command, data))
+            return 0, b""
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._breakpoints = {
+        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
+        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
+    }
+    client = FakeClient()
+    runtime._connect = lambda: client
+
+    result = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="remove",
+        request_id=23,
+    ))
+
+    assert result.error == ""
+    assert result.data["cleared_ids"] == [23]
+    assert result.data["remaining"] == 1
+    assert list(runtime._breakpoints) == [17]
+    assert client.calls == [
+        (Cmd.EVENT, 2, struct.pack(">BI", EventKind.BREAKPOINT, 23))
+    ]
+
+
+def test_breakpoint_remove_by_class_and_line_filters_existing_breakpoints() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def command(self, command_set, command, data=b""):
+            self.calls.append((command_set, command, data))
+            return 0, b""
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._breakpoints = {
+        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
+        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
+        29: {"class": "Lcom/example/Bar;", "method": "other()V", "line": 21},
+    }
+    client = FakeClient()
+    runtime._connect = lambda: client
+
+    result = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="remove",
+        class_pattern="example/Bar",
+        line=20,
+    ))
+
+    assert result.error == ""
+    assert result.data["cleared_ids"] == [23]
+    assert set(runtime._breakpoints) == {17, 29}
+    assert client.calls == [
+        (Cmd.EVENT, 2, struct.pack(">BI", EventKind.BREAKPOINT, 23))
+    ]
+
+
 def _runtime_with_fake_variable_response(stack_error: int, stack_data: bytes):
     class FakeProcessManager:
         is_running = True
@@ -400,6 +506,72 @@ def _runtime_with_fake_variable_response(stack_error: int, stack_data: bytes):
     return runtime
 
 
+def _runtime_with_fake_receiver_and_body_variables():
+    captured: dict[str, list[int]] = {
+        "requested_slots": [],
+        "value_depths": [],
+    }
+
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.METHOD, 2):
+                return 0, b"variable-table"
+            if (command_set, command) == (Cmd.STACK, 1):
+                requested_count = struct.unpack_from(">I", data, 16)[0]
+                offset = 20
+                slots = []
+                for _ in range(requested_count):
+                    slots.append(struct.unpack_from(">I", data, offset)[0])
+                    offset += 5
+                captured["requested_slots"] = slots
+                values = struct.pack(">I", requested_count)
+                for index in range(requested_count):
+                    values += bytes([Tag.OBJECT]) + (100 + index).to_bytes(8, "big")
+                return 0, values
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._active_suspension = SuspensionSnapshot(
+        suspension_id="susp_test",
+        generation=1,
+        request_id=1,
+        thread_id=10,
+        location={},
+        observed_at="2026-07-04T00:00:00+00:00",
+    )
+    runtime._connect = lambda: FakeClient()
+    runtime._resolve_thread_id = lambda jdwp, snapshot, name: 10
+    runtime._read_frames = lambda jdwp, thread_id, count, start_index=0: [{
+        "index": 0,
+        "frame_id": 20,
+        "class_id": 30,
+        "method_id": 40,
+        "location_index": 50,
+        "class": "LFixture;",
+        "method": "run()V",
+        "line": 10,
+        "is_native": False,
+    }]
+    runtime._visible_variables_for_location = lambda data, location: [
+        Variable(name="this", type_name="Lcom/example/WorkflowServiceImpl;", slot=0),
+        Variable(name="body", type_name="Lcom/example/RequestBody;", slot=2),
+    ]
+    runtime._thread_name = lambda jdwp, thread_id: "main"
+
+    def fake_read_value(jdwp, ids, tag, data, offset, depth=3, visited=None):
+        captured["value_depths"].append(depth)
+        return {"value_index": len(captured["value_depths"]), "depth": depth}, offset + 8
+
+    runtime._read_value = fake_read_value
+    return runtime, captured
+
+
 def test_getvalues_error_marks_every_variable_unavailable() -> None:
     runtime = _runtime_with_fake_variable_response(35, b"")
 
@@ -435,6 +607,52 @@ def test_real_null_is_observed_but_missing_batch_value_is_unavailable() -> None:
     assert not_returned["value_state"] == "unavailable"
     assert "value" not in not_returned
     assert "JVM returned no value" in not_returned["error"]
+
+
+def test_variables_skip_this_by_default_and_use_shallow_depth() -> None:
+    runtime, captured = _runtime_with_fake_receiver_and_body_variables()
+
+    result = runtime.variables(RuntimeAction(
+        action="variables",
+        suspension_id="susp_test",
+    ))
+
+    assert result.error == ""
+    assert captured["requested_slots"] == [2]
+    assert captured["value_depths"] == [1]
+    assert result.data["include_this"] is False
+    assert result.data["max_value_depth"] == 1
+    assert result.data["variable_count"] == 1
+    assert result.data["skipped_variable_count"] == 1
+    assert result.data["variables"][0]["name"] == "body"
+    assert result.data["skipped_variables"] == [{
+        "name": "this",
+        "type": "Lcom/example/WorkflowServiceImpl;",
+        "slot": 0,
+        "reason": "excluded_by_default",
+        "hint": "Pass include_this=true to inspect the receiver object.",
+    }]
+
+
+def test_variables_can_include_this_and_increase_value_depth() -> None:
+    runtime, captured = _runtime_with_fake_receiver_and_body_variables()
+
+    result = runtime.variables(RuntimeAction(
+        action="variables",
+        suspension_id="susp_test",
+        include_this=True,
+        max_value_depth=4,
+    ))
+
+    assert result.error == ""
+    assert captured["requested_slots"] == [0, 2]
+    assert captured["value_depths"] == [4, 4]
+    assert result.data["include_this"] is True
+    assert result.data["max_value_depth"] == 4
+    assert result.data["variable_count"] == 2
+    assert result.data["skipped_variable_count"] == 0
+    assert [item["name"] for item in result.data["variables"]] == ["this", "body"]
+    assert result.data["skipped_variables"] == []
 
 
 @pytest.mark.skipif(
