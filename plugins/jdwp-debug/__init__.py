@@ -103,7 +103,9 @@ JAVA_RUNTIME_SCHEMA = {
             },
             "class_pattern": {
                 "type": "string",
-                "description": "Class name substring to match.",
+                "description": "Substring match against the JVM internal class signature (e.g. Lcom/foo/Bar;)."
+                               " To avoid matching CGLIB proxies, "
+                               "include enough path context like foo/Bar;.",
             },
             "line": {
                 "type": "integer", "minimum": 1,
@@ -205,19 +207,19 @@ def _handle_java_runtime(args: dict, **kw) -> str:
     )
 
     dispatch = {
-        "run":        rt.run,
-        "stop":       rt.stop,
-        "restart":    rt.restart,
-        "attach":     rt.attach,
-        "detach":     rt.detach,
-        "status":     rt.status,
-        "logs":       rt.logs,
+        "run": rt.run,
+        "stop": rt.stop,
+        "restart": rt.restart,
+        "attach": rt.attach,
+        "detach": rt.detach,
+        "status": rt.status,
+        "logs": rt.logs,
         "breakpoint": rt.breakpoint,
         "wait_breakpoint": rt.wait_breakpoint,
-        "threads":    rt.threads,
-        "stack":      rt.stack,
-        "variables":  rt.variables,
-        "resume":     rt.resume,
+        "threads": rt.threads,
+        "stack": rt.stack,
+        "variables": rt.variables,
+        "resume": rt.resume,
     }
 
     handler = dispatch.get(action.action)
