@@ -717,6 +717,66 @@ def test_wait_event_returns_exception_suspension() -> None:
     assert runtime._active_suspension.event_kind == "exception"
 
 
+def test_wait_event_resumes_ignored_stale_suspending_event() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        def __init__(self):
+            self.waits = 0
+            self.commands = []
+
+        def wait_for_event(self, timeout):
+            self.waits += 1
+            if self.waits == 1:
+                return {
+                    "suspend_policy": 2,
+                    "events": [{
+                        "kind": EventKind.BREAKPOINT,
+                        "request_id": 41,
+                        "thread_id": 10,
+                        "location": {"class_id": 20, "method_id": 30, "index": 40},
+                    }],
+                }
+            return {
+                "suspend_policy": 2,
+                "events": [{
+                    "kind": EventKind.BREAKPOINT,
+                    "request_id": 42,
+                    "thread_id": 10,
+                    "location": {"class_id": 20, "method_id": 30, "index": 40},
+                }],
+            }
+
+        def command(self, command_set, command, data=b""):
+            self.commands.append((command_set, command, data))
+            if (command_set, command) == (Cmd.VM, 9):
+                return 0, b""
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._breakpoints = {
+        42: {"class": "LExample;", "method": "run()V", "line": 123}
+    }
+    client = FakeClient()
+    runtime._connect = lambda: client
+    runtime._describe_location = lambda jdwp, location: {
+        "class": "LExample;",
+        "method": "run()V",
+        "line": 123,
+    }
+    runtime._thread_name = lambda jdwp, thread_id: "main"
+
+    result = runtime.wait_event(RuntimeAction(action="wait_event", timeout=1))
+
+    assert result.error == ""
+    assert result.data["status"] == "breakpoint_hit"
+    assert result.data["breakpoint"]["line"] == 123
+    assert client.waits == 2
+    assert client.commands == [(Cmd.VM, 9, b"")]
+
+
 def _runtime_with_fake_variable_response(stack_error: int, stack_data: bytes):
     class FakeProcessManager:
         is_running = True

@@ -760,6 +760,7 @@ class JavaRuntime(Runtime):
                 composite = jdwp.wait_for_event(remaining)
                 if composite is None:
                     return self._debug_event_timeout(wait_label, action.timeout)
+                handled = False
                 for event in composite.get("events", []):
                     if event.get("kind") in {
                         EventKind.VM_DEATH, EventKind.VM_DISCONNECTED,
@@ -774,9 +775,13 @@ class JavaRuntime(Runtime):
                     if event_kind not in accepted_kinds:
                         continue
                     if event_kind == EventKind.BREAKPOINT and request_id in self._breakpoints:
+                        handled = True
                         return self._capture_breakpoint_event(jdwp, event)
                     if event_kind == EventKind.EXCEPTION and request_id in self._exceptions:
+                        handled = True
                         return self._capture_exception_event(jdwp, event)
+                if not handled:
+                    self._resume_ignored_suspending_event(jdwp, wait_label, composite)
         except (JDWPError, OSError) as e:
             logger.warning("java_runtime.%s.wait.failed error=%s", wait_label, e)
             return RuntimeResult(ok=False, error=str(e))
@@ -1111,6 +1116,38 @@ class JavaRuntime(Runtime):
             "process_state": "running",
             "debug_state": "attached",
         })
+
+    def _resume_ignored_suspending_event(
+        self,
+        jdwp: JDWPClient,
+        wait_label: str,
+        composite: dict[str, Any],
+    ) -> None:
+        suspend_policy = int(composite.get("suspend_policy", 0) or 0)
+        events = composite.get("events", [])
+        event_kinds = [event.get("kind") for event in events]
+        request_ids = [event.get("request_id") for event in events]
+        if suspend_policy == 0:
+            logger.debug(
+                "java_runtime.%s.wait.ignored_event event_kinds=%s request_ids=%s suspend_policy=%s",
+                wait_label, event_kinds, request_ids, suspend_policy,
+            )
+            return
+
+        logger.warning(
+            "java_runtime.%s.wait.ignored_suspending_event_resume "
+            "suspend_policy=%s event_kinds=%s request_ids=%s "
+            "active_breakpoints=%s active_exceptions=%s",
+            wait_label,
+            suspend_policy,
+            event_kinds,
+            request_ids,
+            sorted(self._breakpoints),
+            sorted(self._exceptions),
+        )
+        err, _ = jdwp.command(Cmd.VM, 9)
+        if err:
+            raise JDWPError(err, "VM resume after ignored stale event failed")
 
     def _reset_debug_state(self) -> None:
         self._disconnect()
