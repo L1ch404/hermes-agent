@@ -599,6 +599,37 @@ def test_exception_set_builds_exception_only_request() -> None:
     assert runtime._exceptions[91]["exception_class"] == "Ljava/lang/NullPointerException;"
 
 
+def test_exception_set_returns_structured_not_loaded_error() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.VM, 3):
+                return 0, _pack_all_classes()
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: FakeClient()
+
+    result = runtime.exception(RuntimeAction(
+        action="exception",
+        exception_class="java.lang.NumberFormatException",
+    ))
+
+    assert result.error == (
+        "Exception class 'Ljava/lang/NumberFormatException;' is not loaded in the target VM"
+    )
+    assert result.data["error_code"] == "exception_class_not_loaded"
+    assert result.data["exception_class"] == "Ljava/lang/NumberFormatException;"
+    assert result.data["retryable"] is True
+    assert result.data["next_action"] == "trigger_code_path_then_retry_exception_set"
+    assert "Trigger the code path once" in result.data["suggestions"][0]
+
+
 def test_exception_list_and_remove_by_request_id() -> None:
     class FakeProcessManager:
         is_running = True

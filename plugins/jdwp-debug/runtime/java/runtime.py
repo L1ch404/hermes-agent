@@ -595,10 +595,24 @@ class JavaRuntime(Runtime):
                     return RuntimeResult(
                         ok=False,
                         error=(
-                            f"Exception class '{normalized_class}' is not loaded in the target VM; "
-                            "retry after the application has loaded it"
+                            f"Exception class '{normalized_class}' is not loaded in the target VM"
                         ),
-                        data={"exception_class": normalized_class},
+                        data={
+                            "error_code": "exception_class_not_loaded",
+                            "exception_class": normalized_class,
+                            "retryable": True,
+                            "next_action": "trigger_code_path_then_retry_exception_set",
+                            "suggestions": [
+                                (
+                                    "Trigger the code path once so the JVM loads this "
+                                    "exception class, then set the exception event again."
+                                ),
+                                (
+                                    "For framework conversion exceptions, send the "
+                                    "request that causes the conversion once, then retry."
+                                ),
+                            ],
+                        },
                     )
                 _type_tag, class_id, _signature = found
 

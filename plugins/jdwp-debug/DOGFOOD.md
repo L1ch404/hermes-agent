@@ -100,6 +100,10 @@ the exact throw location:
 - `java/lang/NullPointerException`
 - `Ljava/lang/NullPointerException;`
 
+If the exception class is not loaded yet, Runtime returns
+`error_code=exception_class_not_loaded`, `retryable=true`, and
+`next_action=trigger_code_path_then_retry_exception_set`.
+
 Then wait for either a line breakpoint or exception event:
 
 ```json
