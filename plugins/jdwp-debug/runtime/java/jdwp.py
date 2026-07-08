@@ -52,11 +52,20 @@ class IDSizes:
     reference_type_id_size: int = 0
     frame_id_size: int = 0
 
+    def pack_field(self, fid: int) -> bytes:
+        return fid.to_bytes(self.field_id_size, "big")
+
+    def pack_method(self, mid: int) -> bytes:
+        return mid.to_bytes(self.method_id_size, "big")
+
     def pack_obj(self, oid: int) -> bytes:
         return oid.to_bytes(self.object_id_size, "big")
 
     def pack_ref(self, rid: int) -> bytes:
         return rid.to_bytes(self.reference_type_id_size, "big")
+
+    def pack_frame(self, fid: int) -> bytes:
+        return fid.to_bytes(self.frame_id_size, "big")
 
 
 # ---- Command set constants ---------------------------------------------

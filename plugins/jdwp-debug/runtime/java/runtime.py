@@ -71,8 +71,13 @@ class JavaRuntime(Runtime):
         "IllegalStateException",
         "IndexOutOfBoundsException",
         "NullPointerException",
+        "NegativeArraySizeException",
+        "NumberFormatException",
         "RuntimeException",
+        "SecurityException",
+        "StringIndexOutOfBoundsException",
         "Throwable",
+        "UnsupportedOperationException",
     }
 
     def __init__(self, host: str = "localhost"):
@@ -374,6 +379,28 @@ class JavaRuntime(Runtime):
                     "breakpoints": breakpoints,
                 })
 
+            if action.bp_action == "set":
+                if not action.class_pattern:
+                    return RuntimeResult(
+                        ok=False,
+                        error="class_pattern is required for breakpoint set",
+                        data={
+                            "error_code": "invalid_argument",
+                            "argument": "class_pattern",
+                            "bp_action": "set",
+                        },
+                    )
+                if action.line <= 0:
+                    return RuntimeResult(
+                        ok=False,
+                        error="line is required for breakpoint set",
+                        data={
+                            "error_code": "invalid_argument",
+                            "argument": "line",
+                            "bp_action": "set",
+                        },
+                    )
+
             jdwp = self._connect()
 
             if action.bp_action == "set":
@@ -430,7 +457,7 @@ class JavaRuntime(Runtime):
                 for mid, mname, msig in methods:
                     err, lt_data = jdwp.command(
                         Cmd.METHOD, 1,
-                        ids.pack_ref(found_cid) + ids.pack_obj(mid)
+                        ids.pack_ref(found_cid) + ids.pack_method(mid)
                     )
                     if err:
                         continue  # abstract / native methods have no line table
@@ -465,7 +492,7 @@ class JavaRuntime(Runtime):
                 bp_payload += struct.pack(">B", 7)  # modKind = LocationOnly
                 bp_payload += struct.pack(">B", found_tag)  # typeTag from JVM (1=class, 2=interface, etc.)
                 bp_payload += ids.pack_ref(found_cid)
-                bp_payload += ids.pack_obj(found_mid)
+                bp_payload += ids.pack_method(found_mid)
                 bp_payload += struct.pack(">Q", found_code_idx)  # jlocation = code index, NOT line number
 
                 err, bp_data = jdwp.command(Cmd.EVENT, 1, bp_payload)
@@ -600,6 +627,7 @@ class JavaRuntime(Runtime):
                         data={
                             "error_code": "exception_class_not_loaded",
                             "exception_class": normalized_class,
+                            "signature": normalized_class,
                             "retryable": True,
                             "next_action": "trigger_code_path_then_retry_exception_set",
                             "suggestions": [
@@ -642,6 +670,7 @@ class JavaRuntime(Runtime):
                     "exception_action": "set",
                     "request_id": request_id,
                     "exception_class": normalized_class,
+                    "signature": normalized_class,
                     "caught": action.caught,
                     "uncaught": action.uncaught,
                 })
@@ -878,7 +907,7 @@ class JavaRuntime(Runtime):
                     data={"frame": self._public_frame(frame)},
                 )
 
-            payload = ids.pack_ref(frame["class_id"]) + ids.pack_obj(frame["method_id"])
+            payload = ids.pack_ref(frame["class_id"]) + ids.pack_method(frame["method_id"])
             err, variable_data = jdwp.command(Cmd.METHOD, 2, payload)
             if err:
                 return RuntimeResult(
@@ -912,7 +941,7 @@ class JavaRuntime(Runtime):
 
             getvalues_error = None
             if variables:
-                values_payload = ids.pack_obj(thread_id) + ids.pack_obj(frame["frame_id"])
+                values_payload = ids.pack_obj(thread_id) + ids.pack_frame(frame["frame_id"])
                 values_payload += struct.pack(">I", len(variables))
                 for variable in variables:
                     values_payload += struct.pack(">I", variable.slot)
@@ -1103,10 +1132,12 @@ class JavaRuntime(Runtime):
         )
         return RuntimeResult(ok=True, data={
             "status": "exception_hit",
+            "event_type": "exception",
             **self._snapshot_context(snapshot),
             "exception": {
                 "request_id": request_id,
                 "exception_class": exception_request.get("exception_class", ""),
+                "signature": exception_request.get("exception_class", ""),
                 "thrown_class": thrown_class,
                 "value": self._reference_value(object_id, "object") if object_id else None,
                 "caught": catch_description is not None,
@@ -1114,8 +1145,13 @@ class JavaRuntime(Runtime):
                 "request_uncaught": exception_request.get("uncaught", False),
             },
             "thread": {"name": thread_name},
+            "throw_location": location_description,
             "location": location_description,
             "catch_location": catch_description,
+            "hint": (
+                "throw_location may be inside JDK or framework code. Inspect the stack "
+                "and the first application frame to find the business root cause."
+            ),
         })
 
     def _debug_event_timeout(self, wait_label: str, timeout: float) -> RuntimeResult:
@@ -1589,7 +1625,7 @@ class JavaRuntime(Runtime):
         err, data = jdwp.command(
             Cmd.METHOD,
             1,
-            ids.pack_ref(class_id) + ids.pack_obj(method_id),
+            ids.pack_ref(class_id) + ids.pack_method(method_id),
         )
         if err:
             return None
@@ -1818,7 +1854,7 @@ class JavaRuntime(Runtime):
             gv_payload = ids.pack_obj(obj_id)
             gv_payload += struct.pack(">I", len(fields))
             for fid, _, _ in fields:
-                gv_payload += fid.to_bytes(ids.field_id_size, "big")  # fieldID uses field_id_size
+                gv_payload += ids.pack_field(fid)
 
             err, gv_data = jdwp.command(Cmd.OBJ_REF, 2, gv_payload)
             if err:

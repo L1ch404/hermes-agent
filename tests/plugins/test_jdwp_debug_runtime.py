@@ -374,6 +374,22 @@ def test_jdwp_parser_handles_exception_event() -> None:
     }
 
 
+def test_id_sizes_pack_each_jdwp_id_kind() -> None:
+    ids = IDSizes(
+        field_id_size=2,
+        method_id_size=4,
+        object_id_size=8,
+        reference_type_id_size=6,
+        frame_id_size=3,
+    )
+
+    assert ids.pack_field(0x1234) == bytes.fromhex("1234")
+    assert ids.pack_method(0x12345678) == bytes.fromhex("12345678")
+    assert ids.pack_obj(0x0102030405060708) == bytes.fromhex("0102030405060708")
+    assert ids.pack_ref(0x010203040506) == bytes.fromhex("010203040506")
+    assert ids.pack_frame(0x010203) == bytes.fromhex("010203")
+
+
 def test_breakpoint_clear_includes_event_kind() -> None:
     class FakeProcessManager:
         is_running = True
@@ -398,6 +414,39 @@ def test_breakpoint_clear_includes_event_kind() -> None:
     assert client.calls == [
         (Cmd.EVENT, 2, struct.pack(">BI", EventKind.BREAKPOINT, 17))
     ]
+
+
+def test_breakpoint_set_validates_required_arguments_without_connecting() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: (_ for _ in ()).throw(AssertionError("should not connect"))
+
+    missing_class = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="set",
+        line=25,
+    ))
+    missing_line = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="set",
+        class_pattern="com/example/Foo;",
+    ))
+
+    assert missing_class.error == "class_pattern is required for breakpoint set"
+    assert missing_class.data == {
+        "error_code": "invalid_argument",
+        "argument": "class_pattern",
+        "bp_action": "set",
+    }
+    assert missing_line.error == "line is required for breakpoint set"
+    assert missing_line.data == {
+        "error_code": "invalid_argument",
+        "argument": "line",
+        "bp_action": "set",
+    }
 
 
 def test_breakpoint_list_returns_request_ids_without_protocol_call() -> None:
@@ -532,6 +581,17 @@ def test_exception_class_names_are_normalized() -> None:
         assert error == ""
         assert normalized == "Ljava/lang/NullPointerException;"
 
+    for value in (
+        "NumberFormatException",
+        "UnsupportedOperationException",
+        "NegativeArraySizeException",
+        "SecurityException",
+        "StringIndexOutOfBoundsException",
+    ):
+        normalized, error = runtime._normalize_exception_signature(value)
+        assert error == ""
+        assert normalized == f"Ljava/lang/{value};"
+
 
 def test_broad_caught_exception_watch_is_rejected_without_connecting() -> None:
     class FakeProcessManager:
@@ -589,6 +649,7 @@ def test_exception_set_builds_exception_only_request() -> None:
         "exception_action": "set",
         "request_id": 91,
         "exception_class": "Ljava/lang/NullPointerException;",
+        "signature": "Ljava/lang/NullPointerException;",
         "caught": True,
         "uncaught": True,
     }
@@ -625,6 +686,7 @@ def test_exception_set_returns_structured_not_loaded_error() -> None:
     )
     assert result.data["error_code"] == "exception_class_not_loaded"
     assert result.data["exception_class"] == "Ljava/lang/NumberFormatException;"
+    assert result.data["signature"] == "Ljava/lang/NumberFormatException;"
     assert result.data["retryable"] is True
     assert result.data["next_action"] == "trigger_code_path_then_retry_exception_set"
     assert "Trigger the code path once" in result.data["suggestions"][0]
@@ -732,18 +794,22 @@ def test_wait_event_returns_exception_suspension() -> None:
 
     assert result.error == ""
     assert result.data["status"] == "exception_hit"
+    assert result.data["event_type"] == "exception"
     assert result.data["event_kind"] == "exception"
     assert result.data["exception"] == {
         "request_id": 91,
         "exception_class": "Ljava/lang/NullPointerException;",
+        "signature": "Ljava/lang/NullPointerException;",
         "thrown_class": "Ljava/lang/NullPointerException;",
         "value": {"_ref": "0x32", "_kind": "object"},
         "caught": True,
         "request_caught": True,
         "request_uncaught": True,
     }
+    assert result.data["throw_location"]["line"] == 123
     assert result.data["location"]["line"] == 123
     assert result.data["catch_location"]["line"] == 123
+    assert "throw_location may be inside JDK or framework code" in result.data["hint"]
     assert runtime._active_suspension is not None
     assert runtime._active_suspension.event_kind == "exception"
 
@@ -1000,6 +1066,130 @@ def test_variables_can_include_this_and_increase_value_depth() -> None:
     assert result.data["skipped_variable_count"] == 0
     assert [item["name"] for item in result.data["variables"]] == ["this", "body"]
     assert result.data["skipped_variables"] == []
+
+
+def test_variables_use_method_and_frame_id_sizes_when_building_payloads() -> None:
+    captured = {}
+
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(
+            field_id_size=2,
+            method_id_size=4,
+            object_id_size=8,
+            reference_type_id_size=6,
+            frame_id_size=3,
+        )
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.METHOD, 2):
+                captured["variable_table_payload"] = data
+                return 0, b"variable-table"
+            if (command_set, command) == (Cmd.STACK, 1):
+                captured["get_values_payload"] = data
+                return 0, struct.pack(">I", 1) + bytes([Tag.INT]) + struct.pack(">i", 123)
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._active_suspension = SuspensionSnapshot(
+        suspension_id="susp_test",
+        generation=1,
+        request_id=1,
+        thread_id=0x0102030405060708,
+        location={},
+        observed_at="2026-07-04T00:00:00+00:00",
+    )
+    runtime._connect = lambda: FakeClient()
+    runtime._resolve_thread_id = lambda jdwp, snapshot, name: snapshot.thread_id
+    runtime._read_frames = lambda jdwp, thread_id, count, start_index=0: [{
+        "index": 0,
+        "frame_id": 0x010203,
+        "class_id": 0x010203040506,
+        "method_id": 0x11223344,
+        "location_index": 50,
+        "class": "LFixture;",
+        "method": "run()V",
+        "line": 10,
+        "is_native": False,
+    }]
+    runtime._visible_variables_for_location = lambda data, location: [
+        Variable(name="answer", type_name="I", slot=7),
+    ]
+    runtime._thread_name = lambda jdwp, thread_id: "main"
+
+    result = runtime.variables(RuntimeAction(
+        action="variables",
+        suspension_id="susp_test",
+    ))
+
+    assert result.error == ""
+    assert result.data["variables"][0]["value"] == 123
+    assert captured["variable_table_payload"] == (
+        bytes.fromhex("010203040506") + bytes.fromhex("11223344")
+    )
+    assert captured["get_values_payload"] == (
+        bytes.fromhex("0102030405060708")
+        + bytes.fromhex("010203")
+        + struct.pack(">I", 1)
+        + struct.pack(">I", 7)
+        + bytes([Tag.INT])
+    )
+
+
+def test_object_field_reads_use_field_id_size() -> None:
+    captured = {}
+
+    class FakeClient:
+        ids = IDSizes(
+            field_id_size=2,
+            method_id_size=4,
+            object_id_size=8,
+            reference_type_id_size=6,
+            frame_id_size=3,
+        )
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.OBJ_REF, 1):
+                return 0, bytes([1]) + bytes.fromhex("010203040506")
+            if (command_set, command) == (Cmd.REF_TYPE, 1):
+                signature = b"LFixture;"
+                return 0, struct.pack(">I", len(signature)) + signature
+            if (command_set, command) == (Cmd.REF_TYPE, 4):
+                name = b"age"
+                signature = b"I"
+                return 0, (
+                    struct.pack(">I", 1)
+                    + bytes.fromhex("1234")
+                    + struct.pack(">I", len(name))
+                    + name
+                    + struct.pack(">I", len(signature))
+                    + signature
+                    + struct.pack(">I", 0)
+                )
+            if (command_set, command) == (Cmd.OBJ_REF, 2):
+                captured["get_values_payload"] = data
+                return 0, struct.pack(">I", 1) + bytes([Tag.INT]) + struct.pack(">i", 20)
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+
+    value = runtime._read_object(
+        FakeClient(),
+        FakeClient.ids,
+        obj_id=0x0102030405060708,
+        depth=1,
+        visited=set(),
+    )
+
+    assert value["age"] == 20
+    assert captured["get_values_payload"] == (
+        bytes.fromhex("0102030405060708")
+        + struct.pack(">I", 1)
+        + bytes.fromhex("1234")
+    )
 
 
 @pytest.mark.skipif(

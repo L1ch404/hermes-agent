@@ -140,11 +140,13 @@ JAVA_RUNTIME_SCHEMA = {
                 "description": (
                     "Exception class to watch for action='exception', accepted as "
                     "java.lang.NullPointerException, java/lang/NullPointerException, "
-                    "or Ljava/lang/NullPointerException;. Runtime normalizes it to "
-                    "a JVM signature. Broad classes such as java.lang.Exception, "
-                    "java.lang.RuntimeException, java.lang.Error, and "
-                    "java.lang.Throwable are refused when caught=true unless "
-                    "allow_broad_caught=true is explicitly set."
+                    "or Ljava/lang/NullPointerException;. Common java.lang simple "
+                    "names such as NullPointerException and NumberFormatException "
+                    "are also accepted. Runtime normalizes the class to a JVM "
+                    "signature. Broad classes such as java.lang.Exception, "
+                    "java.lang.RuntimeException, java.lang.Error, and java.lang.Throwable "
+                    "are refused when caught=true unless allow_broad_caught=true is "
+                    "explicitly set."
                 ),
             },
             "caught": {

@@ -100,6 +100,9 @@ the exact throw location:
 - `java/lang/NullPointerException`
 - `Ljava/lang/NullPointerException;`
 
+Common `java.lang` simple names such as `NullPointerException` and
+`NumberFormatException` are also accepted.
+
 If the exception class is not loaded yet, Runtime returns
 `error_code=exception_class_not_loaded`, `retryable=true`, and
 `next_action=trigger_code_path_then_retry_exception_set`.
@@ -109,6 +112,10 @@ Then wait for either a line breakpoint or exception event:
 ```json
 {"action": "wait_event", "timeout": 30}
 ```
+
+An exception hit includes both `throw_location` and the backward-compatible
+`location` field. `throw_location` may point into JDK or framework code, so
+inspect the stack to find the first relevant application frame.
 
 Specific exceptions default to `caught=true` and `uncaught=true`, because Spring
 and similar frameworks often catch the real exception and wrap it into a generic
