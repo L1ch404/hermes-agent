@@ -112,19 +112,26 @@ JAVA_RUNTIME_SCHEMA = {
                 "type": "string", "enum": ["set", "remove", "list"],
                 "description": (
                     "Breakpoint operation for action='breakpoint'. "
-                    "'set' requires class_pattern and line. "
-                    "'list' returns currently tracked breakpoint request_id values. "
-                    "'remove' prefers request_id; if request_id is omitted, "
+                    "'set' requires class_pattern and line and creates a breakpoint. "
+                    "'list' returns currently tracked breakpoint_id values. "
+                    "'remove' prefers breakpoint_id; if breakpoint_id is omitted, "
                     "class_pattern and/or line are used as selectors; if no selector "
                     "is provided, all breakpoints are cleared for backward compatibility."
+                ),
+            },
+            "breakpoint_id": {
+                "type": "string",
+                "description": (
+                    "Agent-facing breakpoint id returned by breakpoint set/list "
+                    "(for example bp_001). Use with bp_action='remove' to clear "
+                    "exactly one breakpoint."
                 ),
             },
             "request_id": {
                 "type": "integer", "minimum": 1,
                 "description": (
-                    "Event request id returned by breakpoint or exception set/list. "
-                    "Use it with bp_action='remove' or exception_action='remove' "
-                    "to clear exactly one event request."
+                    "Legacy JDWP event request id. Prefer breakpoint_id for breakpoint "
+                    "remove. Still used by exception_action='remove' for exception events."
                 ),
             },
             "exception_action": {
@@ -330,6 +337,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         tail=args.get("tail", 50),
         bp_action=args.get("bp_action", "set"),
         exception_action=args.get("exception_action", "set"),
+        breakpoint_id=args.get("breakpoint_id", ""),
         request_id=args.get("request_id", 0),
         class_pattern=args.get("class_pattern", ""),
         include_proxy=_bool_arg(args, "include_proxy", False),
@@ -354,7 +362,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
     rt = _get_runtime(context_key)
     logger.info(
         "java_runtime.action.start action=%s context=%s pid=%s main_class=%s jar_path=%s "
-        "jdwp=%s:%s breakpoint=%s:%s exception=%s request_id=%s suspension=%s",
+        "jdwp=%s:%s breakpoint=%s:%s breakpoint_id=%s exception=%s request_id=%s suspension=%s",
         action.action,
         context_key,
         action.pid or "-",
@@ -364,6 +372,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         action.jdwp_port,
         action.class_pattern or "-",
         action.line or "-",
+        action.breakpoint_id or "-",
         action.exception_class or "-",
         action.request_id or "-",
         action.suspension_id or "-",

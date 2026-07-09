@@ -73,6 +73,7 @@ class RuntimeAction:
     # debug
     bp_action: str = "set"
     exception_action: str = "set"
+    breakpoint_id: str = ""
     request_id: int = 0
     class_pattern: str = ""
     include_proxy: bool = False

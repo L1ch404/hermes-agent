@@ -56,6 +56,31 @@ class SuspensionSnapshot:
     valid: bool = True
 
 
+@dataclass
+class BreakpointClassCandidate:
+    type_tag: int
+    class_id: int
+    signature: str
+    name: str
+    simple_name: str
+    source_file: str | None
+    is_proxy: bool
+    proxy_type: str | None
+    is_generated: bool
+    match_type: str
+    match_rank: int
+    warnings: list[str]
+
+
+@dataclass
+class BreakpointLocation:
+    method_id: int
+    method: str
+    method_signature: str
+    line: int
+    code_index: int
+
+
 class JavaRuntime(Runtime):
     """Agent-facing Java runtime. One instance manages one application."""
 
@@ -93,6 +118,7 @@ class JavaRuntime(Runtime):
         self._jdwp: JDWPClient | None = None  # persistent debugger connection
         self._active_suspension: SuspensionSnapshot | None = None
         self._suspension_generation = 0
+        self._breakpoint_counter = 0
         self._max_array_elements = 64
         self._max_value_depth = 5
 
@@ -446,115 +472,19 @@ class JavaRuntime(Runtime):
 
             if action.bp_action == "set":
                 ids = jdwp.ids
-                # ── Step 1: find class ──
-                err, data = jdwp.command(Cmd.VM, 3)  # AllClasses
-                if err:
-                    return RuntimeResult(ok=False, error=f"AllClasses failed (err {err})")
+                candidate, resolution_error, _ignored_proxy = self._resolve_breakpoint_class(
+                    jdwp, action
+                )
+                if resolution_error is not None:
+                    return resolution_error
+                assert candidate is not None
 
-                count = struct.unpack_from(">I", data, 0)[0]
-                offset = 4
-                found_cid = None
-                found_sig = ""
-                found_tag = 0
-                skipped_class_matches: list[dict[str, Any]] = []
-                for _ in range(count):
-                    tag = data[offset]; offset += 1
-                    cid = int.from_bytes(data[offset:offset+ids.reference_type_id_size], "big")
-                    offset += ids.reference_type_id_size
-                    slen = struct.unpack_from(">I", data, offset)[0]; offset += 4
-                    sig = data[offset:offset+slen].decode("utf-8"); offset += slen
-                    offset += 4  # status
-                    if action.class_pattern.lower() in sig.lower():
-                        skip_reason = self._class_match_skip_reason(sig, action)
-                        if skip_reason:
-                            skipped_class_matches.append({
-                                "class": sig,
-                                "reason": skip_reason,
-                            })
-                            continue
-                        found_cid = cid
-                        found_sig = sig
-                        found_tag = tag
-                        break
-
-                if found_cid is None:
-                    data: dict[str, Any] = {
-                        "error_code": "class_not_found",
-                        "class_pattern": action.class_pattern,
-                        "suggested_next_step": "Check class_pattern or wait until the application loads the target class.",
-                    }
-                    if skipped_class_matches:
-                        data = {
-                            "error_code": "class_matches_excluded",
-                            "class_pattern": action.class_pattern,
-                            "skipped_matches": skipped_class_matches[:10],
-                            "suggested_next_step": (
-                                "Refine class_pattern to the concrete application class, "
-                                "or set include_proxy/include_generated only if you intentionally "
-                                "want generated or proxy classes."
-                            ),
-                        }
-                    error = f"Class matching '{action.class_pattern}' not found"
-                    if skipped_class_matches:
-                        error = (
-                            f"Class matching '{action.class_pattern}' only matched "
-                            "excluded proxy/generated classes"
-                        )
-                    return RuntimeResult(ok=False, error=error, data=data)
-
-                # ── Step 2: list methods ──
-                err, data = jdwp.command(Cmd.REF_TYPE, 5, ids.pack_ref(found_cid))
-                if err:
-                    return RuntimeResult(ok=False, error=f"Methods failed (err {err})")
-
-                method_count = struct.unpack_from(">I", data, 0)[0]
-                offset = 4
-                methods = []
-                for _ in range(method_count):
-                    mid = int.from_bytes(data[offset:offset+ids.method_id_size], "big")
-                    offset += ids.method_id_size
-                    nlen = struct.unpack_from(">I", data, offset)[0]; offset += 4
-                    mname = data[offset:offset+nlen].decode("utf-8"); offset += nlen
-                    slen = struct.unpack_from(">I", data, offset)[0]; offset += 4
-                    msig = data[offset:offset+slen].decode("utf-8"); offset += slen
-                    offset += 4  # modBits
-                    methods.append((mid, mname, msig))
-
-                # ── Step 3: find method containing the target line ──
-                found_mid = None
-                found_mname = ""
-                found_msig = ""
-                found_code_idx = 0
-                for mid, mname, msig in methods:
-                    err, lt_data = jdwp.command(
-                        Cmd.METHOD, 1,
-                        ids.pack_ref(found_cid) + ids.pack_method(mid)
-                    )
-                    if err:
-                        continue  # abstract / native methods have no line table
-                    # LineTable: start(8) + end(8) + lines_count(4) + [lineCodeIndex(8) + lineNumber(4)]*
-                    line_count = struct.unpack_from(">I", lt_data, 16)[0]
-                    lt_offset = 20
-                    for _ in range(line_count):
-                        code_idx = struct.unpack_from(">Q", lt_data, lt_offset)[0]
-                        lt_offset += 8
-                        line_num = struct.unpack_from(">I", lt_data, lt_offset)[0]
-                        lt_offset += 4
-                        if line_num == action.line:
-                            found_mid = mid
-                            found_mname = mname
-                            found_msig = msig
-                            found_code_idx = code_idx
-                            break
-                    if found_mid:
-                        break
-
-                if found_mid is None:
-                    return RuntimeResult(
-                        ok=False,
-                        error=f"Line {action.line} not found in any method of {found_sig}",
-                        data={"class": found_sig, "line": action.line},
-                    )
+                locations, _nearby, location_error = self._line_locations_for_class(
+                    jdwp, candidate, action.line
+                )
+                if location_error is not None:
+                    return location_error
+                location = locations[0]
 
                 # ── Step 4: set breakpoint (EventRequest/Set, eventKind=BREAKPOINT) ──
                 # eventKind=2 (BREAKPOINT), suspendPolicy=1 (EVENT_THREAD), modifiers=1
@@ -563,33 +493,66 @@ class JavaRuntime(Runtime):
                     ">BBI", EventKind.BREAKPOINT, SuspendPolicy.EVENT_THREAD, 1
                 )
                 bp_payload += struct.pack(">B", 7)  # modKind = LocationOnly
-                bp_payload += struct.pack(">B", found_tag)  # typeTag from JVM (1=class, 2=interface, etc.)
-                bp_payload += ids.pack_ref(found_cid)
-                bp_payload += ids.pack_method(found_mid)
-                bp_payload += struct.pack(">Q", found_code_idx)  # jlocation = code index, NOT line number
+                bp_payload += struct.pack(">B", candidate.type_tag)  # typeTag from JVM (1=class, 2=interface, etc.)
+                bp_payload += ids.pack_ref(candidate.class_id)
+                bp_payload += ids.pack_method(location.method_id)
+                bp_payload += struct.pack(">Q", location.code_index)  # jlocation = code index, NOT line number
 
                 err, bp_data = jdwp.command(Cmd.EVENT, 1, bp_payload)
                 if err:
-                    return RuntimeResult(ok=False, error=f"Set breakpoint failed (err {err})")
+                    return RuntimeResult(
+                        ok=False,
+                        error=f"Set breakpoint failed (err {err})",
+                        data={
+                            "error_code": "SET_BREAKPOINT_FAILED",
+                            "matched_class": candidate.name,
+                            "line": action.line,
+                            "retryable": True,
+                            "suggested_next_step": "Retry, or call cleanup_debug_state and set the breakpoint again.",
+                        },
+                    )
 
                 request_id = struct.unpack_from(">I", bp_data, 0)[0]
+                breakpoint_id = self._next_breakpoint_id()
                 self._breakpoints[request_id] = {
-                    "class": found_sig,
-                    "method": f"{found_mname}{found_msig}",
+                    "breakpoint_id": breakpoint_id,
+                    "class": candidate.signature,
+                    "matched_class": candidate.name,
+                    "source_file": candidate.source_file,
+                    "is_proxy": candidate.is_proxy,
+                    "proxy_type": candidate.proxy_type,
+                    "method": location.method,
+                    "method_signature": location.method_signature,
                     "line": action.line,
+                    "code_index": location.code_index,
+                    "suspend_policy": SuspendPolicy.EVENT_THREAD,
                 }
 
                 logger.info(
-                    "java_runtime.breakpoint.set request_id=%s class=%s method=%s line=%s",
-                    request_id, found_sig, found_mname, action.line,
+                    "java_runtime.breakpoint.set breakpoint_id=%s request_id=%s class=%s method=%s line=%s code_index=%s",
+                    breakpoint_id, request_id, candidate.name, location.method,
+                    action.line, location.code_index,
                 )
 
                 return RuntimeResult(ok=True, data={
-                    "bp_action": "set",
-                    "request_id": request_id,
-                    "class": found_sig,
-                    "method": f"{found_mname}{found_msig}",
+                    "breakpoint_id": breakpoint_id,
+                    "matched_class": candidate.name,
+                    "source_file": candidate.source_file,
+                    "is_proxy": candidate.is_proxy,
                     "line": action.line,
+                    "method": location.method,
+                    "suspend_policy": self._suspend_policy_name(SuspendPolicy.EVENT_THREAD),
+                    "warnings": candidate.warnings,
+                    # Compatibility / diagnostics fields below. LLMs should use
+                    # breakpoint_id; jdwp.request_id is intentionally nested.
+                    "bp_action": "set",
+                    "class": candidate.signature,
+                    "method_signature": location.method_signature,
+                    "proxy_type": candidate.proxy_type,
+                    "jdwp": {
+                        "request_id": request_id,
+                        "suspend_policy": self._suspend_policy_name(SuspendPolicy.EVENT_THREAD),
+                    },
                 })
 
             elif action.bp_action == "remove":
@@ -609,17 +572,22 @@ class JavaRuntime(Runtime):
                     )
 
                 removed = []
+                removed_breakpoint_ids = []
                 failed = []
                 for rid in target_ids:
                     # EventRequest/Clear: eventKind (BREAKPOINT) + requestID.
                     payload = struct.pack(">BI", EventKind.BREAKPOINT, rid)
                     err, _ = jdwp.command(Cmd.EVENT, 2, payload)
                     if err == 0:
-                        self._breakpoints.pop(rid, None)
+                        breakpoint = self._breakpoints.pop(rid, None) or {}
                         removed.append(rid)
+                        removed_breakpoint_ids.append(
+                            breakpoint.get("breakpoint_id", f"jdwp_{rid}")
+                        )
                     else:
                         failed.append({
-                            "request_id": rid,
+                            "breakpoint_id": self._breakpoints.get(rid, {}).get("breakpoint_id", ""),
+                            "jdwp": {"request_id": rid},
                             "error": f"Clear breakpoint failed (err {err})",
                         })
 
@@ -641,12 +609,19 @@ class JavaRuntime(Runtime):
                 return RuntimeResult(ok=True, data={
                     "bp_action": "remove",
                     "selector": self._breakpoint_selector(action),
-                    "cleared_ids": removed,
+                    "cleared_breakpoint_ids": removed_breakpoint_ids,
+                    "cleared_ids": removed_breakpoint_ids,
                     "failed": failed,
                     "partial": bool(failed),
-                    "cleared_all": not action.request_id and not action.class_pattern and not action.line,
+                    "cleared_all": (
+                        not action.breakpoint_id
+                        and not action.request_id
+                        and not action.class_pattern
+                        and not action.line
+                    ),
                     "remaining": len(self._breakpoints),
                     "breakpoints": self._breakpoint_observations(),
+                    "jdwp": {"cleared_request_ids": removed},
                 })
 
             else:
@@ -1540,6 +1515,7 @@ class JavaRuntime(Runtime):
         self._disconnect()
         self._breakpoints.clear()
         self._exceptions.clear()
+        self._breakpoint_counter = 0
         self._invalidate_suspension()
 
     def _invalidate_suspension(self) -> None:
@@ -1607,6 +1583,10 @@ class JavaRuntime(Runtime):
                 return state
         return "observed"
 
+    def _next_breakpoint_id(self) -> str:
+        self._breakpoint_counter += 1
+        return f"bp_{self._breakpoint_counter:03d}"
+
     def _breakpoint_observations(self) -> list[dict[str, Any]]:
         return [
             self._breakpoint_observation(request_id, breakpoint)
@@ -1619,14 +1599,25 @@ class JavaRuntime(Runtime):
         breakpoint: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            "request_id": request_id,
+            "breakpoint_id": breakpoint.get("breakpoint_id", ""),
             "class": breakpoint.get("class", ""),
+            "matched_class": breakpoint.get("matched_class", breakpoint.get("class", "")),
+            "source_file": breakpoint.get("source_file"),
+            "is_proxy": breakpoint.get("is_proxy", False),
             "method": breakpoint.get("method", ""),
             "line": breakpoint.get("line", 0),
+            "jdwp": {
+                "request_id": request_id,
+                "suspend_policy": self._suspend_policy_name(
+                    int(breakpoint.get("suspend_policy", SuspendPolicy.EVENT_THREAD))
+                ),
+            },
         }
 
     def _breakpoint_selector(self, action: RuntimeAction) -> dict[str, Any]:
         selector: dict[str, Any] = {}
+        if action.breakpoint_id:
+            selector["breakpoint_id"] = action.breakpoint_id
         if action.request_id:
             selector["request_id"] = action.request_id
         if action.class_pattern:
@@ -1638,6 +1629,12 @@ class JavaRuntime(Runtime):
         return selector
 
     def _breakpoint_remove_targets(self, action: RuntimeAction) -> list[int]:
+        if action.breakpoint_id:
+            return [
+                request_id
+                for request_id, breakpoint in self._breakpoints.items()
+                if breakpoint.get("breakpoint_id") == action.breakpoint_id
+            ]
         if action.request_id:
             return [action.request_id] if action.request_id in self._breakpoints else []
         if not action.class_pattern and not action.line:
@@ -1655,6 +1652,332 @@ class JavaRuntime(Runtime):
                 targets.append(request_id)
         return targets
 
+    def _breakpoint_class_name(self, signature: str) -> str:
+        return self._java_class_name(signature)
+
+    def _breakpoint_simple_name(self, class_name: str) -> str:
+        return class_name.rsplit(".", 1)[-1].split("$", 1)[0]
+
+    def _normalize_class_pattern(self, class_pattern: str) -> str:
+        raw = (class_pattern or "").strip()
+        if raw.startswith("L") and raw.endswith(";"):
+            raw = raw[1:-1]
+        return raw.replace("/", ".").strip(".")
+
+    def _breakpoint_match_type(
+        self,
+        signature: str,
+        class_pattern: str,
+    ) -> tuple[str, int] | None:
+        raw_pattern = (class_pattern or "").strip()
+        if not raw_pattern:
+            return None
+        class_name = self._breakpoint_class_name(signature)
+        simple_name = self._breakpoint_simple_name(class_name)
+        normalized_pattern = self._normalize_class_pattern(raw_pattern)
+        normalized_signature = signature.replace("/", ".")
+
+        if normalized_pattern == class_name:
+            return "fully_qualified_exact", 10
+        if raw_pattern == signature or normalized_signature == raw_pattern:
+            return "signature_exact", 20
+        if normalized_pattern == simple_name:
+            return "simple_name_exact", 30
+        if "." in normalized_pattern and class_name.endswith(f".{normalized_pattern}"):
+            return "suffix_package_match", 40
+        if (
+            normalized_pattern.lower() in class_name.lower()
+            or raw_pattern.lower() in signature.lower()
+        ):
+            return "fuzzy_contains", 50
+        return None
+
+    def _source_file_for_class(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        class_id: int,
+    ) -> tuple[str | None, str | None]:
+        err, data = jdwp.command(Cmd.REF_TYPE, 7, ids.pack_ref(class_id))
+        if err:
+            return None, f"ReferenceType.SourceFile failed (err {err})"
+        if len(data) < 4:
+            return None, "ReferenceType.SourceFile reply too short"
+        length = struct.unpack_from(">I", data, 0)[0]
+        if len(data) < 4 + length:
+            return None, "ReferenceType.SourceFile reply truncated"
+        return data[4:4 + length].decode("utf-8", errors="replace"), None
+
+    def _proxy_type_for_signature(self, signature: str) -> str | None:
+        lowered = signature.lower()
+        if "$$springcglib$$" in lowered:
+            return "spring_cglib"
+        if "$$enhancerbyspringcglib$$" in lowered:
+            return "spring_cglib_enhancer"
+        if "$$fastclassbyspringcglib$$" in lowered:
+            return "spring_cglib_fastclass"
+        if "$$enhancerbycglib$$" in lowered:
+            return "cglib_enhancer"
+        if "$$fastclassbycglib$$" in lowered:
+            return "cglib_fastclass"
+        if "$proxy" in lowered or "jdk/proxy" in lowered or "jdk.proxy" in lowered:
+            return "jdk_proxy"
+        if "com/sun/proxy" in lowered or "com.sun.proxy" in lowered:
+            return "jdk_proxy"
+        if "bytebuddy" in lowered:
+            return "byte_buddy"
+        if "hibernateproxy" in lowered:
+            return "hibernate_proxy"
+        if "javassist" in lowered:
+            return "javassist"
+        return None
+
+    def _resolve_breakpoint_class(
+        self,
+        jdwp: JDWPClient,
+        action: RuntimeAction,
+    ) -> tuple[BreakpointClassCandidate | None, RuntimeResult | None, list[dict[str, Any]]]:
+        ids = jdwp.ids
+        err, data = jdwp.command(Cmd.VM, 3)  # AllClasses
+        if err:
+            return None, RuntimeResult(
+                ok=False,
+                error=f"AllClasses failed (err {err})",
+                data={
+                    "error_code": "ALL_CLASSES_FAILED",
+                    "retryable": True,
+                    "suggested_next_step": "Retry after the JVM is reachable, or restart/attach again.",
+                },
+            ), []
+
+        count = struct.unpack_from(">I", data, 0)[0]
+        offset = 4
+        candidates: list[BreakpointClassCandidate] = []
+        ignored_proxy_candidates: list[dict[str, Any]] = []
+        ignored_generated_candidates: list[dict[str, Any]] = []
+        for _ in range(count):
+            tag = data[offset]
+            offset += 1
+            cid = int.from_bytes(data[offset:offset + ids.reference_type_id_size], "big")
+            offset += ids.reference_type_id_size
+            slen = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            sig = data[offset:offset + slen].decode("utf-8", errors="replace")
+            offset += slen
+            offset += 4  # status
+            match = self._breakpoint_match_type(sig, action.class_pattern)
+            if match is None:
+                continue
+            match_type, match_rank = match
+            class_name = self._breakpoint_class_name(sig)
+            proxy_type = self._proxy_type_for_signature(sig)
+            is_proxy = proxy_type is not None
+            is_generated = self._is_generated_signature(sig)
+            source_file, source_warning = self._source_file_for_class(jdwp, ids, cid)
+            warning_list = [source_warning] if source_warning else []
+            observation = {
+                "class": class_name,
+                "signature": sig,
+                "source_file": source_file,
+                "proxy_type": proxy_type,
+                "match_type": match_type,
+            }
+            if is_proxy and not action.include_proxy:
+                ignored_proxy_candidates.append(observation)
+                continue
+            if is_generated and not action.include_generated:
+                ignored_generated_candidates.append(observation)
+                continue
+            candidates.append(BreakpointClassCandidate(
+                type_tag=tag,
+                class_id=cid,
+                signature=sig,
+                name=class_name,
+                simple_name=self._breakpoint_simple_name(class_name),
+                source_file=source_file,
+                is_proxy=is_proxy,
+                proxy_type=proxy_type,
+                is_generated=is_generated,
+                match_type=match_type,
+                match_rank=match_rank,
+                warnings=warning_list,
+            ))
+
+        if not candidates:
+            if ignored_proxy_candidates and not ignored_generated_candidates:
+                return None, RuntimeResult(
+                    ok=False,
+                    error="ONLY_PROXY_CLASSES_MATCHED",
+                    data={
+                        "error_code": "ONLY_PROXY_CLASSES_MATCHED",
+                        "class_pattern": action.class_pattern,
+                        "matched_proxy_classes": ignored_proxy_candidates[:10],
+                        "retryable": False,
+                        "suggested_next_step": (
+                            "Use the concrete application class pattern, or set include_proxy=true "
+                            "only if you intentionally want to debug the proxy class."
+                        ),
+                    },
+                ), ignored_proxy_candidates
+            return None, RuntimeResult(
+                ok=False,
+                error=f"Class matching '{action.class_pattern}' not found",
+                data={
+                    "error_code": "CLASS_NOT_FOUND",
+                    "class_pattern": action.class_pattern,
+                    "ignored_proxy_candidates": ignored_proxy_candidates[:10],
+                    "ignored_generated_candidates": ignored_generated_candidates[:10],
+                    "retryable": True,
+                    "suggested_next_step": (
+                        "Check class_pattern, trigger the code path so the class loads, "
+                        "or rebuild/restart the target if source and bytecode diverge."
+                    ),
+                },
+            ), ignored_proxy_candidates
+
+        best_rank = min(candidate.match_rank for candidate in candidates)
+        best = [candidate for candidate in candidates if candidate.match_rank == best_rank]
+        if len(best) > 1:
+            return None, RuntimeResult(
+                ok=False,
+                error="AMBIGUOUS_CLASS_MATCH",
+                data={
+                    "error_code": "AMBIGUOUS_CLASS_MATCH",
+                    "class_pattern": action.class_pattern,
+                    "candidates": [
+                        self._breakpoint_candidate_observation(candidate)
+                        for candidate in best[:10]
+                    ],
+                    "retryable": False,
+                    "suggested_next_step": (
+                        "Use a more specific class_pattern, preferably a fully qualified "
+                        "class name such as com.example.service.FooService."
+                    ),
+                },
+            ), ignored_proxy_candidates
+        return best[0], None, ignored_proxy_candidates
+
+    def _breakpoint_candidate_observation(
+        self,
+        candidate: BreakpointClassCandidate,
+    ) -> dict[str, Any]:
+        return {
+            "class": candidate.name,
+            "signature": candidate.signature,
+            "source_file": candidate.source_file,
+            "is_proxy": candidate.is_proxy,
+            "proxy_type": candidate.proxy_type,
+            "match_type": candidate.match_type,
+        }
+
+    def _methods_for_class(
+        self,
+        jdwp: JDWPClient,
+        candidate: BreakpointClassCandidate,
+    ) -> tuple[list[tuple[int, str, str]], RuntimeResult | None]:
+        ids = jdwp.ids
+        err, data = jdwp.command(Cmd.REF_TYPE, 5, ids.pack_ref(candidate.class_id))
+        if err:
+            return [], RuntimeResult(
+                ok=False,
+                error=f"Methods failed (err {err})",
+                data={
+                    "error_code": "METHODS_FAILED",
+                    "matched_class": candidate.name,
+                    "line": 0,
+                    "retryable": True,
+                    "suggested_next_step": "Retry, or restart/attach to refresh JDWP state.",
+                },
+            )
+
+        method_count = struct.unpack_from(">I", data, 0)[0]
+        offset = 4
+        methods = []
+        for _ in range(method_count):
+            mid = int.from_bytes(data[offset:offset + ids.method_id_size], "big")
+            offset += ids.method_id_size
+            nlen = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            mname = data[offset:offset + nlen].decode("utf-8", errors="replace")
+            offset += nlen
+            slen = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            msig = data[offset:offset + slen].decode("utf-8", errors="replace")
+            offset += slen
+            offset += 4  # modBits
+            methods.append((mid, mname, msig))
+        return methods, None
+
+    def _line_locations_for_class(
+        self,
+        jdwp: JDWPClient,
+        candidate: BreakpointClassCandidate,
+        line: int,
+    ) -> tuple[list[BreakpointLocation], list[dict[str, Any]], RuntimeResult | None]:
+        ids = jdwp.ids
+        methods, error = self._methods_for_class(jdwp, candidate)
+        if error is not None:
+            return [], [], error
+
+        locations: list[BreakpointLocation] = []
+        nearby: list[dict[str, Any]] = []
+        for mid, mname, msig in methods:
+            err, lt_data = jdwp.command(
+                Cmd.METHOD,
+                1,
+                ids.pack_ref(candidate.class_id) + ids.pack_method(mid),
+            )
+            if err or len(lt_data) < 20:
+                continue
+            line_count = struct.unpack_from(">I", lt_data, 16)[0]
+            offset = 20
+            for _ in range(line_count):
+                code_idx = struct.unpack_from(">Q", lt_data, offset)[0]
+                offset += 8
+                line_num = struct.unpack_from(">I", lt_data, offset)[0]
+                offset += 4
+                row = {
+                    "line": line_num,
+                    "method": mname,
+                    "code_index": code_idx,
+                }
+                if line_num == line:
+                    locations.append(BreakpointLocation(
+                        method_id=mid,
+                        method=mname,
+                        method_signature=msig,
+                        line=line_num,
+                        code_index=code_idx,
+                    ))
+                elif abs(line_num - line) <= 5:
+                    nearby.append(row)
+
+        if not locations:
+            nearby = sorted(
+                nearby,
+                key=lambda item: (abs(int(item["line"]) - line), int(item["line"])),
+            )[:10]
+            return [], nearby, RuntimeResult(
+                ok=False,
+                error="NO_EXECUTABLE_LOCATION_AT_LINE",
+                data={
+                    "error_code": "NO_EXECUTABLE_LOCATION_AT_LINE",
+                    "matched_class": candidate.name,
+                    "source_file": candidate.source_file,
+                    "line": line,
+                    "nearby_locations": nearby,
+                    "possible_causes": [
+                        "line is not executable",
+                        "source does not match running bytecode",
+                    ],
+                    "retryable": False,
+                    "suggested_next_step": (
+                        "Set the breakpoint on a nearby executable line or rebuild/restart the target."
+                    ),
+                },
+            )
+        return locations, nearby, None
+
     def _class_match_skip_reason(
         self,
         signature: str,
@@ -1667,21 +1990,7 @@ class JavaRuntime(Runtime):
         return ""
 
     def _is_proxy_signature(self, signature: str) -> bool:
-        lowered = signature.lower()
-        markers = (
-            "$proxy",
-            "$$proxy",
-            "$$springcglib$$",
-            "$$enhancer",
-            "$$fastclass",
-            "cglib",
-            "bytebuddy",
-            "hibernateproxy",
-            "mockitomock",
-            "javassist",
-            "/proxy/",
-        )
-        return any(marker in lowered for marker in markers)
+        return self._proxy_type_for_signature(signature) is not None
 
     def _is_generated_signature(self, signature: str) -> bool:
         lowered = signature.lower()

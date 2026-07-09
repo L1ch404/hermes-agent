@@ -466,6 +466,9 @@ def test_breakpoint_set_skips_proxy_by_default_and_can_opt_in() -> None:
                 return 0, _pack_all_classes(
                     (1, 42, "Lcom/example/UserServiceImpl$$SpringCGLIB$$0;", 7),
                 )
+            if (command_set, command) == (Cmd.REF_TYPE, 7):
+                source = b"UserServiceImpl.java"
+                return 0, struct.pack(">I", len(source)) + source
             if (command_set, command) == (Cmd.REF_TYPE, 5):
                 name = b"handle"
                 signature = b"()V"
@@ -497,15 +500,19 @@ def test_breakpoint_set_skips_proxy_by_default_and_can_opt_in() -> None:
         line=25,
     ))
 
-    assert default_result.error == (
-        "Class matching 'UserServiceImpl' only matched excluded proxy/generated classes"
-    )
-    assert default_result.data["error_code"] == "class_matches_excluded"
-    assert default_result.data["skipped_matches"] == [{
-        "class": "Lcom/example/UserServiceImpl$$SpringCGLIB$$0;",
-        "reason": "proxy_class_excluded",
+    assert default_result.error == "ONLY_PROXY_CLASSES_MATCHED"
+    assert default_result.data["error_code"] == "ONLY_PROXY_CLASSES_MATCHED"
+    assert default_result.data["matched_proxy_classes"] == [{
+        "class": "com.example.UserServiceImpl$$SpringCGLIB$$0",
+        "signature": "Lcom/example/UserServiceImpl$$SpringCGLIB$$0;",
+        "source_file": "UserServiceImpl.java",
+        "proxy_type": "spring_cglib",
+        "match_type": "simple_name_exact",
     }]
-    assert [call[:2] for call in default_client.calls] == [(Cmd.VM, 3)]
+    assert [call[:2] for call in default_client.calls] == [
+        (Cmd.VM, 3),
+        (Cmd.REF_TYPE, 7),
+    ]
 
     opt_in_client = FakeClient()
     runtime._connect = lambda: opt_in_client
@@ -518,7 +525,16 @@ def test_breakpoint_set_skips_proxy_by_default_and_can_opt_in() -> None:
     ))
 
     assert opt_in_result.error == ""
-    assert opt_in_result.data["request_id"] == 99
+    assert opt_in_result.data["breakpoint_id"] == "bp_001"
+    assert opt_in_result.data["matched_class"] == "com.example.UserServiceImpl$$SpringCGLIB$$0"
+    assert opt_in_result.data["source_file"] == "UserServiceImpl.java"
+    assert opt_in_result.data["is_proxy"] is True
+    assert opt_in_result.data["proxy_type"] == "spring_cglib"
+    assert opt_in_result.data["line"] == 25
+    assert opt_in_result.data["method"] == "handle"
+    assert opt_in_result.data["suspend_policy"] == "EVENT_THREAD"
+    assert opt_in_result.data["warnings"] == []
+    assert opt_in_result.data["jdwp"]["request_id"] == 99
     assert opt_in_result.data["class"] == "Lcom/example/UserServiceImpl$$SpringCGLIB$$0;"
     event_payload = next(
         data
@@ -528,6 +544,169 @@ def test_breakpoint_set_skips_proxy_by_default_and_can_opt_in() -> None:
     assert event_payload[:6] == struct.pack(
         ">BBI", EventKind.BREAKPOINT, SuspendPolicy.EVENT_THREAD, 1
     )
+
+
+def test_breakpoint_set_returns_matched_application_location_summary() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.VM, 3):
+                return 0, _pack_all_classes(
+                    (1, 42, "Lcom/example/HgPortraitServiceImpl;", 7),
+                )
+            if (command_set, command) == (Cmd.REF_TYPE, 7):
+                source = b"HgPortraitServiceImpl.java"
+                return 0, struct.pack(">I", len(source)) + source
+            if (command_set, command) == (Cmd.REF_TYPE, 5):
+                name = b"queryPortrait"
+                signature = b"(Ljava/util/List;)Ljava/util/List;"
+                return 0, (
+                    struct.pack(">I", 1)
+                    + (7).to_bytes(8, "big")
+                    + struct.pack(">I", len(name)) + name
+                    + struct.pack(">I", len(signature)) + signature
+                    + struct.pack(">I", 0)
+                )
+            if (command_set, command) == (Cmd.METHOD, 1):
+                return 0, (
+                    struct.pack(">QQI", 0, 200, 1)
+                    + struct.pack(">QI", 128, 716)
+                )
+            if (command_set, command) == (Cmd.EVENT, 1):
+                return 0, struct.pack(">I", 17)
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: FakeClient()
+
+    result = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="set",
+        class_pattern="HgPortraitServiceImpl",
+        line=716,
+    ))
+
+    assert result.error == ""
+    assert result.data["breakpoint_id"] == "bp_001"
+    assert result.data["matched_class"] == "com.example.HgPortraitServiceImpl"
+    assert result.data["source_file"] == "HgPortraitServiceImpl.java"
+    assert result.data["is_proxy"] is False
+    assert result.data["line"] == 716
+    assert result.data["method"] == "queryPortrait"
+    assert result.data["suspend_policy"] == "EVENT_THREAD"
+    assert result.data["warnings"] == []
+    assert "request_id" not in result.data
+    assert result.data["jdwp"] == {
+        "request_id": 17,
+        "suspend_policy": "EVENT_THREAD",
+    }
+    assert runtime._breakpoints[17]["breakpoint_id"] == "bp_001"
+
+
+def test_breakpoint_set_returns_ambiguous_class_match() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.VM, 3):
+                return 0, _pack_all_classes(
+                    (1, 42, "Lcom/example/a/DuplicateService;", 7),
+                    (1, 43, "Lcom/example/b/DuplicateService;", 7),
+                )
+            if (command_set, command) == (Cmd.REF_TYPE, 7):
+                ref_id = int.from_bytes(data, "big")
+                source = (b"DuplicateServiceA.java" if ref_id == 42 else b"DuplicateServiceB.java")
+                return 0, struct.pack(">I", len(source)) + source
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: FakeClient()
+
+    result = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="set",
+        class_pattern="DuplicateService",
+        line=10,
+    ))
+
+    assert result.ok is False
+    assert result.error == "AMBIGUOUS_CLASS_MATCH"
+    assert result.data["error_code"] == "AMBIGUOUS_CLASS_MATCH"
+    assert [item["class"] for item in result.data["candidates"]] == [
+        "com.example.a.DuplicateService",
+        "com.example.b.DuplicateService",
+    ]
+    assert "fully qualified" in result.data["suggested_next_step"]
+
+
+def test_breakpoint_set_returns_no_executable_location_error() -> None:
+    class FakeProcessManager:
+        is_running = True
+
+    class FakeClient:
+        ids = IDSizes(8, 8, 8, 8, 8)
+
+        def command(self, command_set, command, data=b""):
+            if (command_set, command) == (Cmd.VM, 3):
+                return 0, _pack_all_classes(
+                    (1, 42, "Lcom/example/HgPortraitServiceImpl;", 7),
+                )
+            if (command_set, command) == (Cmd.REF_TYPE, 7):
+                source = b"HgPortraitServiceImpl.java"
+                return 0, struct.pack(">I", len(source)) + source
+            if (command_set, command) == (Cmd.REF_TYPE, 5):
+                name = b"queryPortrait"
+                signature = b"(Ljava/util/List;)Ljava/util/List;"
+                return 0, (
+                    struct.pack(">I", 1)
+                    + (7).to_bytes(8, "big")
+                    + struct.pack(">I", len(name)) + name
+                    + struct.pack(">I", len(signature)) + signature
+                    + struct.pack(">I", 0)
+                )
+            if (command_set, command) == (Cmd.METHOD, 1):
+                return 0, (
+                    struct.pack(">QQI", 0, 200, 2)
+                    + struct.pack(">QI", 120, 714)
+                    + struct.pack(">QI", 128, 717)
+                )
+            raise AssertionError((command_set, command, data))
+
+    runtime = JavaRuntime()
+    runtime._proc = FakeProcessManager()
+    runtime._connect = lambda: FakeClient()
+
+    result = runtime.breakpoint(RuntimeAction(
+        action="breakpoint",
+        bp_action="set",
+        class_pattern="HgPortraitServiceImpl",
+        line=716,
+    ))
+
+    assert result.ok is False
+    assert result.error == "NO_EXECUTABLE_LOCATION_AT_LINE"
+    assert result.data["error_code"] == "NO_EXECUTABLE_LOCATION_AT_LINE"
+    assert result.data["matched_class"] == "com.example.HgPortraitServiceImpl"
+    assert result.data["source_file"] == "HgPortraitServiceImpl.java"
+    assert result.data["line"] == 716
+    assert result.data["possible_causes"] == [
+        "line is not executable",
+        "source does not match running bytecode",
+    ]
+    assert "nearby executable line" in result.data["suggested_next_step"]
+    assert result.data["nearby_locations"] == [
+        {"line": 717, "method": "queryPortrait", "code_index": 128},
+        {"line": 714, "method": "queryPortrait", "code_index": 120},
+    ]
 
 
 def test_generated_class_match_requires_explicit_opt_in() -> None:
@@ -550,8 +729,24 @@ def test_breakpoint_list_returns_request_ids_without_protocol_call() -> None:
     runtime = JavaRuntime()
     runtime._proc = FakeProcessManager()
     runtime._breakpoints = {
-        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
-        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
+        17: {
+            "breakpoint_id": "bp_001",
+            "class": "Lcom/example/Foo;",
+            "matched_class": "com.example.Foo",
+            "source_file": "Foo.java",
+            "is_proxy": False,
+            "method": "run",
+            "line": 10,
+        },
+        23: {
+            "breakpoint_id": "bp_002",
+            "class": "Lcom/example/Bar;",
+            "matched_class": "com.example.Bar",
+            "source_file": "Bar.java",
+            "is_proxy": False,
+            "method": "handle",
+            "line": 20,
+        },
     }
     runtime._connect = lambda: (_ for _ in ()).throw(AssertionError("list should not connect"))
 
@@ -562,16 +757,24 @@ def test_breakpoint_list_returns_request_ids_without_protocol_call() -> None:
     assert result.data["count"] == 2
     assert result.data["breakpoints"] == [
         {
-            "request_id": 17,
+            "breakpoint_id": "bp_001",
             "class": "Lcom/example/Foo;",
-            "method": "run()V",
+            "matched_class": "com.example.Foo",
+            "source_file": "Foo.java",
+            "is_proxy": False,
+            "method": "run",
             "line": 10,
+            "jdwp": {"request_id": 17, "suspend_policy": "EVENT_THREAD"},
         },
         {
-            "request_id": 23,
+            "breakpoint_id": "bp_002",
             "class": "Lcom/example/Bar;",
-            "method": "handle()V",
+            "matched_class": "com.example.Bar",
+            "source_file": "Bar.java",
+            "is_proxy": False,
+            "method": "handle",
             "line": 20,
+            "jdwp": {"request_id": 23, "suspend_policy": "EVENT_THREAD"},
         },
     ]
 
@@ -591,8 +794,8 @@ def test_breakpoint_remove_by_request_id_only_clears_that_breakpoint() -> None:
     runtime = JavaRuntime()
     runtime._proc = FakeProcessManager()
     runtime._breakpoints = {
-        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
-        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
+        17: {"breakpoint_id": "bp_001", "class": "Lcom/example/Foo;", "method": "run", "line": 10},
+        23: {"breakpoint_id": "bp_002", "class": "Lcom/example/Bar;", "method": "handle", "line": 20},
     }
     client = FakeClient()
     runtime._connect = lambda: client
@@ -604,7 +807,9 @@ def test_breakpoint_remove_by_request_id_only_clears_that_breakpoint() -> None:
     ))
 
     assert result.error == ""
-    assert result.data["cleared_ids"] == [23]
+    assert result.data["cleared_ids"] == ["bp_002"]
+    assert result.data["cleared_breakpoint_ids"] == ["bp_002"]
+    assert result.data["jdwp"]["cleared_request_ids"] == [23]
     assert result.data["remaining"] == 1
     assert list(runtime._breakpoints) == [17]
     assert client.calls == [
@@ -627,9 +832,9 @@ def test_breakpoint_remove_by_class_and_line_filters_existing_breakpoints() -> N
     runtime = JavaRuntime()
     runtime._proc = FakeProcessManager()
     runtime._breakpoints = {
-        17: {"class": "Lcom/example/Foo;", "method": "run()V", "line": 10},
-        23: {"class": "Lcom/example/Bar;", "method": "handle()V", "line": 20},
-        29: {"class": "Lcom/example/Bar;", "method": "other()V", "line": 21},
+        17: {"breakpoint_id": "bp_001", "class": "Lcom/example/Foo;", "method": "run", "line": 10},
+        23: {"breakpoint_id": "bp_002", "class": "Lcom/example/Bar;", "method": "handle", "line": 20},
+        29: {"breakpoint_id": "bp_003", "class": "Lcom/example/Bar;", "method": "other", "line": 21},
     }
     client = FakeClient()
     runtime._connect = lambda: client
@@ -642,7 +847,8 @@ def test_breakpoint_remove_by_class_and_line_filters_existing_breakpoints() -> N
     ))
 
     assert result.error == ""
-    assert result.data["cleared_ids"] == [23]
+    assert result.data["cleared_ids"] == ["bp_002"]
+    assert result.data["cleared_breakpoint_ids"] == ["bp_002"]
     assert set(runtime._breakpoints) == {17, 29}
     assert client.calls == [
         (Cmd.EVENT, 2, struct.pack(">BI", EventKind.BREAKPOINT, 23))
