@@ -97,6 +97,12 @@ class EventKind:
     VM_DISCONNECTED = 100
 
 
+class SuspendPolicy:
+    NONE = 0
+    EVENT_THREAD = 1
+    ALL = 2
+
+
 # ---- JDWP tagged-value type constants ----------------------------------
 
 class Tag:

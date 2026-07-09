@@ -24,7 +24,7 @@ from ..base import (
     Runtime, RuntimeAction, RuntimeResult,
     Variable,
 )
-from .jdwp import JDWPClient, JDWPError, Cmd, EventKind, Tag
+from .jdwp import JDWPClient, JDWPError, Cmd, EventKind, SuspendPolicy, Tag
 from .process import ProcessManager
 from .log import LogManager
 
@@ -47,8 +47,12 @@ class SuspensionSnapshot:
     thread_id: int
     location: dict[str, int]
     observed_at: str
+    created_at: str = ""
     event_kind: str = "breakpoint"
+    event_type: str = "breakpoint"
+    suspend_policy: int = SuspendPolicy.EVENT_THREAD
     event: dict[str, Any] | None = None
+    resumed: bool = False
     valid: bool = True
 
 
@@ -326,12 +330,49 @@ class JavaRuntime(Runtime):
         else:
             info["main_class"] = proc.main_class
 
-        # Try JDWP for extra info
+        # Try JDWP for extra info and promote any already-queued debug event.
+        # This keeps status honest when the JVM is suspended but the agent has
+        # not called wait_event yet.
         try:
             jdwp = self._connect()
+            promoted: RuntimeResult | None = None
+            if self._active_suspension is None:
+                promoted = self._drain_pending_debug_events(jdwp, "status")
+
             info["debug_state"] = (
                 "suspended" if self._active_suspension is not None else "attached"
             )
+            info["suspension_id"] = (
+                self._active_suspension.suspension_id
+                if self._active_suspension is not None else None
+            )
+            if promoted is not None:
+                if promoted.ok:
+                    info["pending_event_promoted"] = True
+                    info["pending_event"] = {
+                        key: promoted.data[key]
+                        for key in (
+                            "status",
+                            "event_kind",
+                            "event_type",
+                            "suspend_policy",
+                            "suspend_policy_name",
+                            "request_id",
+                            "thread_id",
+                            "location",
+                            "throw_location",
+                        )
+                        if key in promoted.data
+                    }
+                    info["suggested_next_step"] = (
+                        "Inspect stack/variables for the promoted suspension, "
+                        "then call resume with the suspension_id."
+                    )
+                else:
+                    info["pending_event_error"] = promoted.error
+                    if promoted.data:
+                        info["pending_event_error_code"] = promoted.data.get("error_code")
+
             err, data = jdwp.command(Cmd.VM, 1)  # Version
             if err == 0:
                 offset = 0
@@ -415,6 +456,7 @@ class JavaRuntime(Runtime):
                 found_cid = None
                 found_sig = ""
                 found_tag = 0
+                skipped_class_matches: list[dict[str, Any]] = []
                 for _ in range(count):
                     tag = data[offset]; offset += 1
                     cid = int.from_bytes(data[offset:offset+ids.reference_type_id_size], "big")
@@ -423,13 +465,42 @@ class JavaRuntime(Runtime):
                     sig = data[offset:offset+slen].decode("utf-8"); offset += slen
                     offset += 4  # status
                     if action.class_pattern.lower() in sig.lower():
+                        skip_reason = self._class_match_skip_reason(sig, action)
+                        if skip_reason:
+                            skipped_class_matches.append({
+                                "class": sig,
+                                "reason": skip_reason,
+                            })
+                            continue
                         found_cid = cid
                         found_sig = sig
                         found_tag = tag
                         break
 
                 if found_cid is None:
-                    return RuntimeResult(ok=False, error=f"Class matching '{action.class_pattern}' not found")
+                    data: dict[str, Any] = {
+                        "error_code": "class_not_found",
+                        "class_pattern": action.class_pattern,
+                        "suggested_next_step": "Check class_pattern or wait until the application loads the target class.",
+                    }
+                    if skipped_class_matches:
+                        data = {
+                            "error_code": "class_matches_excluded",
+                            "class_pattern": action.class_pattern,
+                            "skipped_matches": skipped_class_matches[:10],
+                            "suggested_next_step": (
+                                "Refine class_pattern to the concrete application class, "
+                                "or set include_proxy/include_generated only if you intentionally "
+                                "want generated or proxy classes."
+                            ),
+                        }
+                    error = f"Class matching '{action.class_pattern}' not found"
+                    if skipped_class_matches:
+                        error = (
+                            f"Class matching '{action.class_pattern}' only matched "
+                            "excluded proxy/generated classes"
+                        )
+                    return RuntimeResult(ok=False, error=error, data=data)
 
                 # ── Step 2: list methods ──
                 err, data = jdwp.command(Cmd.REF_TYPE, 5, ids.pack_ref(found_cid))
@@ -486,9 +557,11 @@ class JavaRuntime(Runtime):
                     )
 
                 # ── Step 4: set breakpoint (EventRequest/Set, eventKind=BREAKPOINT) ──
-                # eventKind=2 (BREAKPOINT), suspendPolicy=2 (SUSPEND_ALL), modifiers=1
+                # eventKind=2 (BREAKPOINT), suspendPolicy=1 (EVENT_THREAD), modifiers=1
                 # modifier: modKind=7 (LocationOnly), typeTag from JVM, classID, methodID, codeIndex
-                bp_payload = struct.pack(">BBI", 2, 2, 1)  # eventKind, suspendPolicy, modifier count
+                bp_payload = struct.pack(
+                    ">BBI", EventKind.BREAKPOINT, SuspendPolicy.EVENT_THREAD, 1
+                )
                 bp_payload += struct.pack(">B", 7)  # modKind = LocationOnly
                 bp_payload += struct.pack(">B", found_tag)  # typeTag from JVM (1=class, 2=interface, etc.)
                 bp_payload += ids.pack_ref(found_cid)
@@ -644,10 +717,12 @@ class JavaRuntime(Runtime):
                     )
                 _type_tag, class_id, _signature = found
 
-                # EventRequest/Set: eventKind=EXCEPTION, suspendPolicy=SUSPEND_ALL,
+                # EventRequest/Set: eventKind=EXCEPTION, suspendPolicy=EVENT_THREAD,
                 # modifiers=1. ExceptionOnly modifier: modKind=8, referenceTypeID,
                 # notifyCaught, notifyUncaught.
-                payload = struct.pack(">BBI", EventKind.EXCEPTION, 2, 1)
+                payload = struct.pack(
+                    ">BBI", EventKind.EXCEPTION, SuspendPolicy.EVENT_THREAD, 1
+                )
                 payload += struct.pack(">B", 8)
                 payload += jdwp.ids.pack_ref(class_id)
                 payload += struct.pack(">BB", int(action.caught), int(action.uncaught))
@@ -776,17 +851,28 @@ class JavaRuntime(Runtime):
         accepted_kinds: set[int],
         wait_label: str,
     ) -> RuntimeResult:
-        if self._active_suspension is not None:
+        if (
+            self._active_suspension is not None
+            and self._active_suspension.valid
+            and not self._active_suspension.resumed
+        ):
             logger.info(
-                "java_runtime.%s.wait.already_suspended suspension=%s generation=%s event_kind=%s",
+                "java_runtime.%s.wait.active_suspension_exists "
+                "suspension=%s generation=%s event_kind=%s suspend_policy=%s",
                 wait_label,
                 self._active_suspension.suspension_id,
                 self._active_suspension.generation,
                 self._active_suspension.event_kind,
+                self._active_suspension.suspend_policy,
             )
-            return RuntimeResult(ok=True, data={
-                "status": "already_suspended",
+            return RuntimeResult(ok=False, error="ACTIVE_SUSPENSION_EXISTS", data={
+                "error_code": "active_suspension_exists",
+                "status": "active_suspension_exists",
                 **self._snapshot_context(self._active_suspension),
+                "suggested_next_step": (
+                    "Call resume with this suspension_id before waiting for another event. "
+                    "If the JVM state looks dirty, call cleanup_debug_state."
+                ),
             })
 
         try:
@@ -795,6 +881,11 @@ class JavaRuntime(Runtime):
                 wait_label, action.timeout, len(self._breakpoints), len(self._exceptions),
             )
             jdwp = self._connect()
+            promoted = self._drain_pending_debug_events(
+                jdwp, wait_label, accepted_kinds
+            )
+            if promoted is not None:
+                return promoted
             deadline = time.monotonic() + max(action.timeout, 0.1)
             while True:
                 remaining = deadline - time.monotonic()
@@ -803,28 +894,11 @@ class JavaRuntime(Runtime):
                 composite = jdwp.wait_for_event(remaining)
                 if composite is None:
                     return self._debug_event_timeout(wait_label, action.timeout)
-                handled = False
-                for event in composite.get("events", []):
-                    if event.get("kind") in {
-                        EventKind.VM_DEATH, EventKind.VM_DISCONNECTED,
-                    }:
-                        self._invalidate_suspension()
-                        return RuntimeResult(
-                            ok=False,
-                            error=f"Target VM exited while waiting for {wait_label}",
-                        )
-                    request_id = int(event.get("request_id", 0))
-                    event_kind = int(event.get("kind", 0))
-                    if event_kind not in accepted_kinds:
-                        continue
-                    if event_kind == EventKind.BREAKPOINT and request_id in self._breakpoints:
-                        handled = True
-                        return self._capture_breakpoint_event(jdwp, event)
-                    if event_kind == EventKind.EXCEPTION and request_id in self._exceptions:
-                        handled = True
-                        return self._capture_exception_event(jdwp, event)
-                if not handled:
-                    self._resume_ignored_suspending_event(jdwp, wait_label, composite)
+                handled = self._handle_debug_composite(
+                    jdwp, composite, accepted_kinds, wait_label
+                )
+                if handled is not None:
+                    return handled
         except (JDWPError, OSError) as e:
             logger.warning("java_runtime.%s.wait.failed error=%s", wait_label, e)
             return RuntimeResult(ok=False, error=str(e))
@@ -1026,23 +1100,160 @@ class JavaRuntime(Runtime):
         try:
             snapshot = self._require_suspension(action)
             jdwp = self._connect()
-            err, _ = jdwp.command(Cmd.VM, 9)
+            err, resume_scope = self._resume_snapshot(jdwp, snapshot)
             if err:
-                return RuntimeResult(ok=False, error=f"VM resume failed (err {err})")
+                return RuntimeResult(
+                    ok=False,
+                    error=f"{resume_scope} resume failed (err {err})",
+                    data={
+                        "error_code": "resume_failed",
+                        **self._snapshot_context(snapshot),
+                        "resume_scope": resume_scope,
+                        "suggested_next_step": (
+                            "Call cleanup_debug_state to clear local debug requests "
+                            "and emergency-resume the VM."
+                        ),
+                    },
+                )
             suspension_id = snapshot.suspension_id
+            snapshot.resumed = True
             self._invalidate_suspension()
             logger.info(
-                "java_runtime.suspension.resumed suspension=%s generation=%s",
-                suspension_id, snapshot.generation,
+                "java_runtime.suspension.resumed suspension=%s generation=%s "
+                "resume_scope=%s suspend_policy=%s thread_id=%s",
+                suspension_id, snapshot.generation, resume_scope,
+                snapshot.suspend_policy, snapshot.thread_id,
             )
             return RuntimeResult(ok=True, data={
                 "status": "resumed",
                 "invalidated_suspension_id": suspension_id,
+                "resume_scope": resume_scope,
+                "suspend_policy": snapshot.suspend_policy,
+                "suspend_policy_name": self._suspend_policy_name(snapshot.suspend_policy),
+                "thread_id": snapshot.thread_id,
                 "process_state": "running",
                 "debug_state": "attached",
+                "suggested_next_step": (
+                    "Continue the scenario, then call wait_event or wait_breakpoint "
+                    "for the next expected debug event."
+                ),
             })
         except (JDWPError, RuntimeError) as e:
             return RuntimeResult(ok=False, error=str(e))
+
+    def cleanup_debug_state(self, action: RuntimeAction) -> RuntimeResult:
+        """Best-effort recovery for dirty dogfood debug state."""
+        if not self._proc.is_running:
+            self._reset_debug_state()
+            return RuntimeResult(ok=True, data={
+                "status": "debug_state_cleaned",
+                "process_state": "absent",
+                "debug_state": "detached",
+                "message": "No running application; local debug state was cleared.",
+                "suggested_next_step": "Start or attach to an application before setting debug events again.",
+            })
+
+        warnings: list[str] = []
+        drained_events = 0
+        resumed_active_suspension = False
+        emergency_vm_resume = False
+        cleared_breakpoints: list[int] = []
+        cleared_exceptions: list[int] = []
+        clear_failures: list[dict[str, Any]] = []
+
+        try:
+            jdwp = self._connect()
+
+            for composite in jdwp.drain_events():
+                drained_events += 1
+                try:
+                    self._resume_ignored_suspending_event(
+                        jdwp, "cleanup_debug_state", composite
+                    )
+                except JDWPError as exc:
+                    warnings.append(str(exc))
+
+            for request_id in list(self._breakpoints):
+                payload = struct.pack(">BI", EventKind.BREAKPOINT, request_id)
+                err, _ = jdwp.command(Cmd.EVENT, 2, payload)
+                if err:
+                    clear_failures.append({
+                        "event_kind": "breakpoint",
+                        "request_id": request_id,
+                        "error": f"Clear breakpoint failed (err {err})",
+                    })
+                else:
+                    cleared_breakpoints.append(request_id)
+
+            for request_id in list(self._exceptions):
+                payload = struct.pack(">BI", EventKind.EXCEPTION, request_id)
+                err, _ = jdwp.command(Cmd.EVENT, 2, payload)
+                if err:
+                    clear_failures.append({
+                        "event_kind": "exception",
+                        "request_id": request_id,
+                        "error": f"Clear exception event failed (err {err})",
+                    })
+                else:
+                    cleared_exceptions.append(request_id)
+
+            if (
+                self._active_suspension is not None
+                and self._active_suspension.valid
+                and not self._active_suspension.resumed
+            ):
+                err, scope = self._resume_snapshot(jdwp, self._active_suspension)
+                if err:
+                    warnings.append(f"{scope} resume failed (err {err})")
+                else:
+                    self._active_suspension.resumed = True
+                    resumed_active_suspension = True
+
+            err, _ = jdwp.command(Cmd.VM, 9)
+            if err:
+                warnings.append(f"Emergency VM.Resume failed (err {err})")
+            else:
+                emergency_vm_resume = True
+
+            self._breakpoints.clear()
+            self._exceptions.clear()
+            self._invalidate_suspension()
+
+            logger.info(
+                "java_runtime.cleanup_debug_state.finish drained_events=%s "
+                "cleared_breakpoints=%s cleared_exceptions=%s failures=%s "
+                "resumed_active=%s emergency_vm_resume=%s warnings=%s",
+                drained_events, len(cleared_breakpoints), len(cleared_exceptions),
+                len(clear_failures), resumed_active_suspension,
+                emergency_vm_resume, len(warnings),
+            )
+            return RuntimeResult(ok=True, data={
+                "status": "debug_state_cleaned",
+                "process_state": "running",
+                "debug_state": "attached",
+                "drained_events": drained_events,
+                "resumed_active_suspension": resumed_active_suspension,
+                "emergency_vm_resume": emergency_vm_resume,
+                "cleared_breakpoint_ids": cleared_breakpoints,
+                "cleared_exception_ids": cleared_exceptions,
+                "cleared_local_breakpoint_count": len(cleared_breakpoints),
+                "cleared_local_exception_count": len(cleared_exceptions),
+                "clear_failures": clear_failures,
+                "warnings": warnings,
+                "suggested_next_step": (
+                    "Call status to confirm debug_state=attached and counts are 0, "
+                    "then set the needed breakpoint or exception event again."
+                ),
+            })
+        except (JDWPError, OSError) as e:
+            logger.warning("java_runtime.cleanup_debug_state.failed error=%s", e)
+            return RuntimeResult(ok=False, error=str(e), data={
+                "error_code": "cleanup_debug_state_failed",
+                "suggested_next_step": (
+                    "If the target process is still running, detach/attach or restart it; "
+                    "otherwise call stop and run again."
+                ),
+            })
 
     # ── Internal ───────────────────────────────────────
 
@@ -1050,17 +1261,22 @@ class JavaRuntime(Runtime):
         self,
         jdwp: JDWPClient,
         event: dict[str, Any],
+        suspend_policy: int = SuspendPolicy.EVENT_THREAD,
     ) -> RuntimeResult:
         request_id = int(event.get("request_id", 0))
         self._suspension_generation += 1
+        observed_at = datetime.now(timezone.utc).isoformat()
         snapshot = SuspensionSnapshot(
             suspension_id=f"susp_{uuid.uuid4().hex[:12]}",
             generation=self._suspension_generation,
             request_id=request_id,
             thread_id=int(event["thread_id"]),
             location=event.get("location") or {},
-            observed_at=datetime.now(timezone.utc).isoformat(),
+            observed_at=observed_at,
+            created_at=observed_at,
             event_kind="breakpoint",
+            event_type="breakpoint",
+            suspend_policy=suspend_policy,
             event=event,
         )
         self._active_suspension = snapshot
@@ -1089,18 +1305,23 @@ class JavaRuntime(Runtime):
         self,
         jdwp: JDWPClient,
         event: dict[str, Any],
+        suspend_policy: int = SuspendPolicy.EVENT_THREAD,
     ) -> RuntimeResult:
         request_id = int(event.get("request_id", 0))
         exception_request = self._exceptions[request_id]
         self._suspension_generation += 1
+        observed_at = datetime.now(timezone.utc).isoformat()
         snapshot = SuspensionSnapshot(
             suspension_id=f"susp_{uuid.uuid4().hex[:12]}",
             generation=self._suspension_generation,
             request_id=request_id,
             thread_id=int(event["thread_id"]),
             location=event.get("location") or {},
-            observed_at=datetime.now(timezone.utc).isoformat(),
+            observed_at=observed_at,
+            created_at=observed_at,
             event_kind="exception",
+            event_type="exception",
+            suspend_policy=suspend_policy,
             event=event,
         )
         self._active_suspension = snapshot
@@ -1165,7 +1386,73 @@ class JavaRuntime(Runtime):
             "timeout_seconds": timeout,
             "process_state": "running",
             "debug_state": "attached",
+            "suggested_next_step": (
+                "Trigger the target code path again, or call status/list to confirm "
+                "the expected breakpoint or exception event is still registered."
+            ),
         })
+
+    def _drain_pending_debug_events(
+        self,
+        jdwp: JDWPClient,
+        wait_label: str,
+        accepted_kinds: set[int] | None = None,
+    ) -> RuntimeResult | None:
+        accepted = accepted_kinds if accepted_kinds is not None else self._accepted_event_kinds()
+        for composite in jdwp.drain_events():
+            handled = self._handle_debug_composite(
+                jdwp,
+                composite,
+                accepted,
+                wait_label,
+            )
+            if handled is not None:
+                return handled
+        return None
+
+    def _accepted_event_kinds(self) -> set[int]:
+        accepted_kinds: set[int] = set()
+        if self._breakpoints:
+            accepted_kinds.add(EventKind.BREAKPOINT)
+        if self._exceptions:
+            accepted_kinds.add(EventKind.EXCEPTION)
+        return accepted_kinds
+
+    def _handle_debug_composite(
+        self,
+        jdwp: JDWPClient,
+        composite: dict[str, Any],
+        accepted_kinds: set[int],
+        wait_label: str,
+    ) -> RuntimeResult | None:
+        suspend_policy = int(composite.get("suspend_policy", SuspendPolicy.NONE) or 0)
+        handled = False
+        for event in composite.get("events", []):
+            if event.get("kind") in {
+                EventKind.VM_DEATH, EventKind.VM_DISCONNECTED,
+            }:
+                self._invalidate_suspension()
+                return RuntimeResult(
+                    ok=False,
+                    error=f"Target VM exited while waiting for {wait_label}",
+                    data={
+                        "error_code": "target_vm_exited",
+                        "suggested_next_step": "Call status, then run or attach to a live JVM again.",
+                    },
+                )
+            request_id = int(event.get("request_id", 0))
+            event_kind = int(event.get("kind", 0))
+            if event_kind not in accepted_kinds:
+                continue
+            if event_kind == EventKind.BREAKPOINT and request_id in self._breakpoints:
+                handled = True
+                return self._capture_breakpoint_event(jdwp, event, suspend_policy)
+            if event_kind == EventKind.EXCEPTION and request_id in self._exceptions:
+                handled = True
+                return self._capture_exception_event(jdwp, event, suspend_policy)
+        if not handled:
+            self._resume_ignored_suspending_event(jdwp, wait_label, composite)
+        return None
 
     def _resume_ignored_suspending_event(
         self,
@@ -1177,7 +1464,7 @@ class JavaRuntime(Runtime):
         events = composite.get("events", [])
         event_kinds = [event.get("kind") for event in events]
         request_ids = [event.get("request_id") for event in events]
-        if suspend_policy == 0:
+        if suspend_policy == SuspendPolicy.NONE:
             logger.debug(
                 "java_runtime.%s.wait.ignored_event event_kinds=%s request_ids=%s suspend_policy=%s",
                 wait_label, event_kinds, request_ids, suspend_policy,
@@ -1195,9 +1482,51 @@ class JavaRuntime(Runtime):
             sorted(self._breakpoints),
             sorted(self._exceptions),
         )
+        if suspend_policy == SuspendPolicy.EVENT_THREAD:
+            thread_ids = sorted({
+                int(event.get("thread_id", 0) or 0)
+                for event in events
+                if int(event.get("thread_id", 0) or 0) > 0
+            })
+            if thread_ids:
+                for thread_id in thread_ids:
+                    err, _ = jdwp.command(
+                        Cmd.THREAD, 3, jdwp.ids.pack_obj(thread_id)
+                    )
+                    if err:
+                        raise JDWPError(
+                            err,
+                            "Thread resume after ignored stale event failed",
+                        )
+                return
+
         err, _ = jdwp.command(Cmd.VM, 9)
         if err:
             raise JDWPError(err, "VM resume after ignored stale event failed")
+
+    def _resume_snapshot(
+        self,
+        jdwp: JDWPClient,
+        snapshot: SuspensionSnapshot,
+    ) -> tuple[int, str]:
+        if snapshot.suspend_policy == SuspendPolicy.NONE:
+            return 0, "none"
+        if snapshot.suspend_policy == SuspendPolicy.EVENT_THREAD:
+            err, _ = jdwp.command(
+                Cmd.THREAD, 3, jdwp.ids.pack_obj(snapshot.thread_id)
+            )
+            return err, "event_thread"
+        err, _ = jdwp.command(Cmd.VM, 9)
+        return err, "vm"
+
+    def _suspend_policy_name(self, suspend_policy: int) -> str:
+        if suspend_policy == SuspendPolicy.NONE:
+            return "NONE"
+        if suspend_policy == SuspendPolicy.EVENT_THREAD:
+            return "EVENT_THREAD"
+        if suspend_policy == SuspendPolicy.ALL:
+            return "SUSPEND_ALL"
+        return f"UNKNOWN_{suspend_policy}"
 
     def _reset_debug_state(self) -> None:
         self._disconnect()
@@ -1219,7 +1548,7 @@ class JavaRuntime(Runtime):
         snapshot = self._active_suspension
         if snapshot is None or not snapshot.valid:
             raise RuntimeError(
-                "No active breakpoint suspension. Call wait_breakpoint or wait_event after triggering the debug event."
+                "No active debug suspension. Call wait_event or wait_breakpoint after triggering the debug event."
             )
         if action.suspension_id and action.suspension_id != snapshot.suspension_id:
             raise RuntimeError(
@@ -1235,11 +1564,18 @@ class JavaRuntime(Runtime):
         return {
             "suspension_id": snapshot.suspension_id,
             "generation": snapshot.generation,
+            "request_id": snapshot.request_id,
+            "thread_id": snapshot.thread_id,
             "observed_at": snapshot.observed_at,
-            "valid_while_suspended": True,
+            "created_at": snapshot.created_at or snapshot.observed_at,
+            "valid_while_suspended": snapshot.valid and not snapshot.resumed,
             "process_state": "running",
             "debug_state": "suspended",
             "event_kind": snapshot.event_kind,
+            "event_type": snapshot.event_type,
+            "suspend_policy": snapshot.suspend_policy,
+            "suspend_policy_name": self._suspend_policy_name(snapshot.suspend_policy),
+            "resumed": snapshot.resumed,
         }
 
     def _variable_observation(self, variable: Variable) -> dict[str, Any]:
@@ -1303,6 +1639,46 @@ class JavaRuntime(Runtime):
             if class_matches and line_matches:
                 targets.append(request_id)
         return targets
+
+    def _class_match_skip_reason(
+        self,
+        signature: str,
+        action: RuntimeAction,
+    ) -> str:
+        if self._is_proxy_signature(signature) and not action.include_proxy:
+            return "proxy_class_excluded"
+        if self._is_generated_signature(signature) and not action.include_generated:
+            return "generated_class_excluded"
+        return ""
+
+    def _is_proxy_signature(self, signature: str) -> bool:
+        lowered = signature.lower()
+        markers = (
+            "$proxy",
+            "$$proxy",
+            "$$springcglib$$",
+            "$$enhancer",
+            "$$fastclass",
+            "cglib",
+            "bytebuddy",
+            "hibernateproxy",
+            "mockitomock",
+            "javassist",
+            "/proxy/",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _is_generated_signature(self, signature: str) -> bool:
+        lowered = signature.lower()
+        markers = (
+            "$$lambda$",
+            "$lambda$",
+            "$generated",
+            "/generated/",
+            "/generatedsources/",
+            "/generated-sources/",
+        )
+        return any(marker in lowered for marker in markers)
 
     def _exception_observations(self) -> list[dict[str, Any]]:
         return [

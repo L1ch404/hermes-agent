@@ -52,13 +52,15 @@ JAVA_RUNTIME_SCHEMA = {
                 "enum": [
                     "run", "stop", "restart", "attach", "detach", "status", "logs", "breakpoint",
                     "exception", "wait_event", "wait_breakpoint", "threads", "stack", "variables", "resume",
+                    "cleanup_debug_state",
                 ],
                 "description": (
                     "Operation to perform. wait_event blocks until a breakpoint or "
                     "exception hit; wait_breakpoint is the compatibility form that "
                     "only accepts breakpoint hits. threads/stack/variables require "
                     "an active debug suspension; "
-                    "resume invalidates that suspension."
+                    "resume invalidates that suspension. cleanup_debug_state is an "
+                    "emergency dogfood recovery action that resumes/clears known debug state."
                 ),
             },
             "classpath": {
@@ -180,8 +182,23 @@ JAVA_RUNTIME_SCHEMA = {
                     "Substring match against the JVM internal class signature "
                     "(e.g. Lcom/foo/Bar;). For bp_action='set', this selects the "
                     "target class. For bp_action='remove' without request_id, this "
-                    "filters active breakpoints by class. To avoid matching CGLIB "
-                    "proxies, include enough path context like foo/Bar;."
+                    "filters active breakpoints by class. Runtime excludes proxy and "
+                    "generated classes by default; use include_proxy/include_generated "
+                    "only when you intentionally want those classes."
+                ),
+            },
+            "include_proxy": {
+                "type": "boolean", "default": False,
+                "description": (
+                    "Used by breakpoint set. Defaults to false so CGLIB/JDK/ByteBuddy/"
+                    "Hibernate proxy classes are skipped during class_pattern matching."
+                ),
+            },
+            "include_generated": {
+                "type": "boolean", "default": False,
+                "description": (
+                    "Used by breakpoint set. Defaults to false so generated classes "
+                    "such as lambda/generated helper classes are skipped during class matching."
                 ),
             },
             "line": {
@@ -291,6 +308,8 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         exception_action=args.get("exception_action", "set"),
         request_id=args.get("request_id", 0),
         class_pattern=args.get("class_pattern", ""),
+        include_proxy=_bool_arg(args, "include_proxy", False),
+        include_generated=_bool_arg(args, "include_generated", False),
         exception_class=args.get("exception_class", ""),
         caught=_bool_arg(args, "caught", True),
         uncaught=_bool_arg(args, "uncaught", True),
@@ -339,6 +358,7 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         "stack": rt.stack,
         "variables": rt.variables,
         "resume": rt.resume,
+        "cleanup_debug_state": rt.cleanup_debug_state,
     }
 
     handler = dispatch.get(action.action)

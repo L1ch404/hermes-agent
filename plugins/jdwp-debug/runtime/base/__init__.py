@@ -75,6 +75,8 @@ class RuntimeAction:
     exception_action: str = "set"
     request_id: int = 0
     class_pattern: str = ""
+    include_proxy: bool = False
+    include_generated: bool = False
     exception_class: str = ""
     caught: bool = True
     uncaught: bool = True
@@ -181,4 +183,8 @@ class Runtime(ABC):
 
     @abstractmethod
     def resume(self, action: RuntimeAction) -> RuntimeResult:
+        ...
+
+    @abstractmethod
+    def cleanup_debug_state(self, action: RuntimeAction) -> RuntimeResult:
         ...
