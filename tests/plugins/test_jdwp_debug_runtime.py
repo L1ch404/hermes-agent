@@ -1338,7 +1338,16 @@ def _runtime_with_fake_receiver_and_body_variables():
     ]
     runtime._thread_name = lambda jdwp, thread_id: "main"
 
-    def fake_read_value(jdwp, ids, tag, data, offset, depth=3, visited=None):
+    def fake_read_value(
+        jdwp,
+        ids,
+        tag,
+        data,
+        offset,
+        depth=3,
+        visited=None,
+        **_kwargs,
+    ):
         captured["value_depths"].append(depth)
         return {"value_index": len(captured["value_depths"]), "depth": depth}, offset + 8
 
@@ -1498,6 +1507,471 @@ def test_variables_use_method_and_frame_id_sizes_when_building_payloads() -> Non
         + struct.pack(">I", 7)
         + bytes([Tag.INT])
     )
+
+
+def _raw_value_bytes(tag: int, value, ids: IDSizes) -> bytes:
+    if tag == Tag.INT:
+        return struct.pack(">i", value)
+    if tag == Tag.BOOLEAN:
+        return bytes([1 if value else 0])
+    if tag == Tag.LONG:
+        return struct.pack(">q", value)
+    if tag in {
+        Tag.ARRAY,
+        Tag.OBJECT,
+        Tag.STRING,
+        Tag.THREAD,
+        Tag.THREAD_GROUP,
+        Tag.CLASS_LOADER,
+        Tag.CLASS_OBJECT,
+    }:
+        return ids.pack_obj(int(value or 0))
+    raise AssertionError(f"Unsupported fake tag {tag}")
+
+
+def _pack_tagged_value(tag: int, value, ids: IDSizes) -> bytes:
+    return bytes([tag]) + _raw_value_bytes(tag, value, ids)
+
+
+def _pack_fake_fields(fields: list[tuple[int, str, str]]) -> bytes:
+    payload = struct.pack(">I", len(fields))
+    for field_id, name, signature in fields:
+        name_bytes = name.encode("utf-8")
+        signature_bytes = signature.encode("utf-8")
+        payload += field_id.to_bytes(8, "big")
+        payload += struct.pack(">I", len(name_bytes)) + name_bytes
+        payload += struct.pack(">I", len(signature_bytes)) + signature_bytes
+        payload += struct.pack(">I", 0)
+    return payload
+
+
+class SemanticCollectionsFakeClient:
+    ids = IDSizes(8, 8, 8, 8, 8)
+
+    def __init__(self):
+        self.object_types: dict[int, tuple[int, int]] = {}
+        self.signatures: dict[int, str] = {}
+        self.fields: dict[int, list[tuple[int, str, str]]] = {}
+        self.superclasses: dict[int, int] = {}
+        self.object_values: dict[int, dict[int, tuple[int, object]]] = {}
+        self.arrays: dict[int, tuple[int, int, list[tuple[int, object]]]] = {}
+        self.strings: dict[int, str] = {}
+
+    def add_type(
+        self,
+        ref_type_id: int,
+        signature: str,
+        *,
+        fields: list[tuple[int, str, str]] | None = None,
+        superclass: int = 0,
+    ) -> None:
+        self.signatures[ref_type_id] = signature
+        self.fields[ref_type_id] = fields or []
+        self.superclasses[ref_type_id] = superclass
+
+    def add_object(
+        self,
+        obj_id: int,
+        ref_type_id: int,
+        field_values: dict[int, tuple[int, object]] | None = None,
+        *,
+        type_tag: int = 1,
+    ) -> None:
+        self.object_types[obj_id] = (type_tag, ref_type_id)
+        self.object_values[obj_id] = field_values or {}
+
+    def add_array(
+        self,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        values: list[tuple[int, object]],
+        *,
+        element_tag: int = Tag.OBJECT,
+    ) -> None:
+        self.add_type(ref_type_id, signature)
+        self.add_object(obj_id, ref_type_id, type_tag=3)
+        self.arrays[obj_id] = (element_tag, ref_type_id, values)
+
+    def command(self, command_set, command, data=b""):
+        ids = self.ids
+        if (command_set, command) == (Cmd.OBJ_REF, 1):
+            obj_id = int.from_bytes(data[:ids.object_id_size], "big")
+            type_tag, ref_type_id = self.object_types[obj_id]
+            return 0, bytes([type_tag]) + ids.pack_ref(ref_type_id)
+        if (command_set, command) == (Cmd.REF_TYPE, 1):
+            ref_type_id = int.from_bytes(data[:ids.reference_type_id_size], "big")
+            signature = self.signatures[ref_type_id].encode("utf-8")
+            return 0, struct.pack(">I", len(signature)) + signature
+        if (command_set, command) == (Cmd.REF_TYPE, 4):
+            ref_type_id = int.from_bytes(data[:ids.reference_type_id_size], "big")
+            return 0, _pack_fake_fields(self.fields.get(ref_type_id, []))
+        if (command_set, command) == (Cmd.CLASS_TYPE, 1):
+            ref_type_id = int.from_bytes(data[:ids.reference_type_id_size], "big")
+            return 0, ids.pack_ref(self.superclasses.get(ref_type_id, 0))
+        if (command_set, command) == (Cmd.OBJ_REF, 2):
+            obj_id = int.from_bytes(data[:ids.object_id_size], "big")
+            count = struct.unpack_from(">I", data, ids.object_id_size)[0]
+            offset = ids.object_id_size + 4
+            payload = struct.pack(">I", count)
+            for _ in range(count):
+                field_id = int.from_bytes(data[offset:offset + ids.field_id_size], "big")
+                offset += ids.field_id_size
+                tag, value = self.object_values[obj_id][field_id]
+                payload += _pack_tagged_value(tag, value, ids)
+            return 0, payload
+        if (command_set, command) == (Cmd.ARRAY, 1):
+            arr_id = int.from_bytes(data[:ids.object_id_size], "big")
+            return 0, struct.pack(">I", len(self.arrays[arr_id][2]))
+        if (command_set, command) == (Cmd.ARRAY, 2):
+            arr_id = int.from_bytes(data[:ids.object_id_size], "big")
+            first, length = struct.unpack_from(">II", data, ids.object_id_size)
+            element_tag, _ref_type_id, values = self.arrays[arr_id]
+            selected = values[first:first + length]
+            payload = bytes([element_tag]) + struct.pack(">I", len(selected))
+            for tag, value in selected:
+                if JavaRuntime()._array_elements_are_tagged(element_tag):
+                    payload += _pack_tagged_value(tag, value, ids)
+                else:
+                    payload += _raw_value_bytes(tag, value, ids)
+            return 0, payload
+        if (command_set, command) == (Cmd.STRING_REF, 1):
+            obj_id = int.from_bytes(data[:ids.object_id_size], "big")
+            value = self.strings[obj_id].encode("utf-8")
+            return 0, struct.pack(">I", len(value)) + value
+        raise AssertionError((command_set, command, data))
+
+
+def _read_fake_object(
+    client: SemanticCollectionsFakeClient,
+    obj_id: int,
+    *,
+    depth: int = 2,
+    semantic_collections: bool = True,
+    item_limit: int = 16,
+    map_entry_limit: int = 16,
+):
+    runtime = JavaRuntime()
+    value, offset = runtime._read_value(
+        client,
+        client.ids,
+        Tag.OBJECT,
+        client.ids.pack_obj(obj_id),
+        0,
+        depth=depth,
+        visited=set(),
+        semantic_collections=semantic_collections,
+        item_limit=item_limit,
+        map_entry_limit=map_entry_limit,
+    )
+    assert offset == client.ids.object_id_size
+    return value
+
+
+def _read_fake_array(
+    client: SemanticCollectionsFakeClient,
+    arr_id: int,
+    *,
+    depth: int = 2,
+    semantic_collections: bool = True,
+    item_limit: int = 16,
+):
+    runtime = JavaRuntime()
+    value, offset = runtime._read_value(
+        client,
+        client.ids,
+        Tag.ARRAY,
+        client.ids.pack_obj(arr_id),
+        0,
+        depth=depth,
+        visited=set(),
+        semantic_collections=semantic_collections,
+        item_limit=item_limit,
+        map_entry_limit=16,
+    )
+    assert offset == client.ids.object_id_size
+    return value
+
+
+def test_semantic_array_and_arraylist_output_use_logical_items() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.strings = {301: "Alice", 302: "Bob", 303: "Carol"}
+    client.add_array(
+        200,
+        2000,
+        "[Ljava/lang/String;",
+        [(Tag.STRING, 301), (Tag.STRING, 302), (Tag.STRING, 303)],
+    )
+    client.add_type(
+        1000,
+        "Ljava/util/ArrayList;",
+        fields=[
+            (1, "size", "I"),
+            (2, "elementData", "[Ljava/lang/Object;"),
+        ],
+    )
+    client.add_object(100, 1000, {
+        1: (Tag.INT, 2),
+        2: (Tag.ARRAY, 200),
+    })
+
+    array_value = _read_fake_array(client, 200, item_limit=2)
+    list_value = _read_fake_object(client, 100)
+
+    assert array_value == {
+        "_ref": "0xc8",
+        "_kind": "array",
+        "_class": "[Ljava.lang.String;",
+        "length": 3,
+        "items": ["Alice", "Bob"],
+        "truncated": True,
+        "item_limit": 2,
+    }
+    assert list_value == {
+        "_ref": "0x64",
+        "_kind": "list",
+        "_class": "java.util.ArrayList",
+        "size": 2,
+        "items": ["Alice", "Bob"],
+        "truncated": False,
+        "item_limit": 16,
+    }
+
+
+def test_semantic_collections_false_keeps_raw_arraylist_fields() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.add_array(200, 2000, "[Ljava/lang/Object;", [])
+    client.add_type(
+        1000,
+        "Ljava/util/ArrayList;",
+        fields=[
+            (1, "size", "I"),
+            (2, "elementData", "[Ljava/lang/Object;"),
+        ],
+    )
+    client.add_object(100, 1000, {
+        1: (Tag.INT, 0),
+        2: (Tag.ARRAY, 200),
+    })
+
+    value = _read_fake_object(client, 100, semantic_collections=False)
+
+    assert value["_kind"] == "object"
+    assert value["_class"] == "Ljava/util/ArrayList;"
+    assert value["size"] == 0
+    assert value["elementData"]["_kind"] == "array"
+    assert value["elementData"]["_length"] == 0
+    assert "items" not in value["elementData"]
+
+
+def test_semantic_collection_items_respect_visited_refs() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.add_array(
+        200,
+        2000,
+        "[Ljava/lang/Object;",
+        [(Tag.OBJECT, 100)],
+    )
+    client.add_type(
+        1000,
+        "Ljava/util/ArrayList;",
+        fields=[
+            (1, "size", "I"),
+            (2, "elementData", "[Ljava/lang/Object;"),
+        ],
+    )
+    client.add_object(100, 1000, {
+        1: (Tag.INT, 1),
+        2: (Tag.ARRAY, 200),
+    })
+
+    value = _read_fake_object(client, 100, depth=3)
+
+    assert value["_kind"] == "list"
+    assert value["items"] == [{"_ref": "0x64", "_kind": "object"}]
+    assert "value_state" not in value
+
+
+def test_semantic_linked_list_traverses_nodes_without_exposing_node_fields() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.strings = {301: "first", 302: "second"}
+    client.add_type(
+        1100,
+        "Ljava/util/LinkedList;",
+        fields=[(1, "size", "I"), (2, "first", "Ljava/util/LinkedList$Node;")],
+    )
+    client.add_type(
+        1200,
+        "Ljava/util/LinkedList$Node;",
+        fields=[
+            (3, "item", "Ljava/lang/Object;"),
+            (4, "next", "Ljava/util/LinkedList$Node;"),
+        ],
+    )
+    client.add_object(100, 1100, {1: (Tag.INT, 2), 2: (Tag.OBJECT, 201)})
+    client.add_object(201, 1200, {3: (Tag.STRING, 301), 4: (Tag.OBJECT, 202)})
+    client.add_object(202, 1200, {3: (Tag.STRING, 302), 4: (Tag.OBJECT, 0)})
+
+    value = _read_fake_object(client, 100)
+
+    assert value["_kind"] == "list"
+    assert value["_class"] == "java.util.LinkedList"
+    assert value["size"] == 2
+    assert value["items"] == ["first", "second"]
+    assert "value_state" not in value
+
+
+def test_semantic_linked_hash_map_reads_inherited_hashmap_table() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.strings = {301: "id", 302: "42"}
+    client.add_type(
+        1000,
+        "Ljava/util/HashMap;",
+        fields=[(1, "size", "I"), (2, "table", "[Ljava/util/HashMap$Node;")],
+    )
+    client.add_type(1001, "Ljava/util/LinkedHashMap;", superclass=1000)
+    client.add_type(
+        1200,
+        "Ljava/util/HashMap$Node;",
+        fields=[
+            (3, "key", "Ljava/lang/Object;"),
+            (4, "value", "Ljava/lang/Object;"),
+            (5, "next", "Ljava/util/HashMap$Node;"),
+        ],
+    )
+    client.add_array(
+        200,
+        2000,
+        "[Ljava/util/HashMap$Node;",
+        [(Tag.OBJECT, 0), (Tag.OBJECT, 201)],
+    )
+    client.add_object(100, 1001, {1: (Tag.INT, 1), 2: (Tag.ARRAY, 200)})
+    client.add_object(201, 1200, {
+        3: (Tag.STRING, 301),
+        4: (Tag.STRING, 302),
+        5: (Tag.OBJECT, 0),
+    })
+
+    value = _read_fake_object(client, 100)
+
+    assert value == {
+        "_ref": "0x64",
+        "_kind": "map",
+        "_class": "java.util.LinkedHashMap",
+        "size": 1,
+        "entries": [{"key": "id", "value": "42"}],
+        "truncated": False,
+        "entry_limit": 16,
+    }
+
+
+def test_semantic_linked_hash_set_reads_internal_map_keys() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.strings = {301: "red", 302: "blue"}
+    client.add_type(
+        1000,
+        "Ljava/util/HashSet;",
+        fields=[(1, "map", "Ljava/util/HashMap;")],
+    )
+    client.add_type(1001, "Ljava/util/LinkedHashSet;", superclass=1000)
+    client.add_type(
+        1100,
+        "Ljava/util/HashMap;",
+        fields=[(2, "size", "I"), (3, "table", "[Ljava/util/HashMap$Node;")],
+    )
+    client.add_type(
+        1200,
+        "Ljava/util/HashMap$Node;",
+        fields=[
+            (4, "key", "Ljava/lang/Object;"),
+            (5, "value", "Ljava/lang/Object;"),
+            (6, "next", "Ljava/util/HashMap$Node;"),
+        ],
+    )
+    client.add_array(
+        300,
+        2000,
+        "[Ljava/util/HashMap$Node;",
+        [(Tag.OBJECT, 201), (Tag.OBJECT, 202)],
+    )
+    client.add_object(100, 1001, {1: (Tag.OBJECT, 150)})
+    client.add_object(150, 1100, {2: (Tag.INT, 2), 3: (Tag.ARRAY, 300)})
+    client.add_object(201, 1200, {
+        4: (Tag.STRING, 301),
+        5: (Tag.OBJECT, 999),
+        6: (Tag.OBJECT, 0),
+    })
+    client.add_object(202, 1200, {
+        4: (Tag.STRING, 302),
+        5: (Tag.OBJECT, 999),
+        6: (Tag.OBJECT, 0),
+    })
+
+    value = _read_fake_object(client, 100)
+
+    assert value["_kind"] == "set"
+    assert value["_class"] == "java.util.LinkedHashSet"
+    assert value["size"] == 2
+    assert value["items"] == ["red", "blue"]
+    assert value["truncated"] is False
+
+
+def test_semantic_optional_present_and_empty() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.strings = {301: "present"}
+    client.add_type(
+        1000,
+        "Ljava/util/Optional;",
+        fields=[(1, "value", "Ljava/lang/Object;")],
+    )
+    client.add_object(100, 1000, {1: (Tag.STRING, 301)})
+    client.add_object(101, 1000, {1: (Tag.OBJECT, 0)})
+
+    present = _read_fake_object(client, 100)
+    empty = _read_fake_object(client, 101)
+
+    assert present == {
+        "_ref": "0x64",
+        "_kind": "optional",
+        "_class": "java.util.Optional",
+        "present": True,
+        "value": "present",
+    }
+    assert empty == {
+        "_ref": "0x65",
+        "_kind": "optional",
+        "_class": "java.util.Optional",
+        "present": False,
+        "value": None,
+    }
+
+
+def test_semantic_collection_failure_is_unavailable_not_empty() -> None:
+    client = SemanticCollectionsFakeClient()
+    client.add_type(
+        1000,
+        "Ljava/util/ArrayList;",
+        fields=[(1, "size", "I")],
+    )
+    client.add_object(100, 1000, {1: (Tag.INT, 2)})
+
+    value = _read_fake_object(client, 100)
+    variable = Variable(
+        name="names",
+        type_name="Ljava/util/ArrayList;",
+        slot=1,
+        value=value,
+        value_observed=True,
+    )
+
+    observed = JavaRuntime()._variable_observation(variable)
+
+    assert value["size"] == 2
+    assert value["items"] == []
+    assert value["value_state"] == "unavailable"
+    assert "elementData" in value["error"]
+    assert observed["value_state"] == "unavailable"
+    assert observed["value"] == value
 
 
 def test_object_field_reads_use_field_id_size() -> None:

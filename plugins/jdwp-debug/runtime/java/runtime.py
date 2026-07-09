@@ -1012,6 +1012,8 @@ class JavaRuntime(Runtime):
                 variables = kept_variables
 
             value_depth = self._value_depth(action.max_value_depth)
+            item_limit = self._collection_item_limit(action.item_limit)
+            map_entry_limit = self._collection_item_limit(action.map_entry_limit)
 
             getvalues_error = None
             if variables:
@@ -1032,6 +1034,9 @@ class JavaRuntime(Runtime):
                                 jdwp, ids, tag, values_data, offset,
                                 depth=value_depth,
                                 visited=set(),
+                                semantic_collections=action.semantic_collections,
+                                item_limit=item_limit,
+                                map_entry_limit=map_entry_limit,
                             )
                             variables[index].value_observed = True
                         except Exception as exc:
@@ -1091,6 +1096,9 @@ class JavaRuntime(Runtime):
                 "skipped_variables": skipped_variables,
                 "include_this": action.include_this,
                 "max_value_depth": value_depth,
+                "semantic_collections": action.semantic_collections,
+                "item_limit": item_limit,
+                "map_entry_limit": map_entry_limit,
                 "getvalues_error": getvalues_error,
             })
         except (JDWPError, RuntimeError) as e:
@@ -1585,12 +1593,19 @@ class JavaRuntime(Runtime):
             "slot": variable.slot,
         }
         if variable.value_observed:
-            result["value_state"] = "observed"
+            result["value_state"] = self._observed_value_state(variable.value)
             result["value"] = variable.value
         else:
             result["value_state"] = "unavailable"
             result["error"] = variable.error or "Variable value was not returned by the JVM"
         return result
+
+    def _observed_value_state(self, value: Any) -> str:
+        if isinstance(value, dict):
+            state = value.get("value_state")
+            if state in {"observed", "partial", "unavailable"}:
+                return state
+        return "observed"
 
     def _breakpoint_observations(self) -> list[dict[str, Any]]:
         return [
@@ -1775,6 +1790,13 @@ class JavaRuntime(Runtime):
         except (TypeError, ValueError):
             depth = 1
         return max(0, min(depth, self._max_value_depth))
+
+    def _collection_item_limit(self, requested_limit: int) -> int:
+        try:
+            limit = int(requested_limit)
+        except (TypeError, ValueError):
+            limit = 16
+        return max(0, min(limit, self._max_array_elements))
 
     def _all_thread_ids(self, jdwp: JDWPClient) -> list[int]:
         ids = jdwp.ids
@@ -2104,6 +2126,269 @@ class JavaRuntime(Runtime):
             result["_class"] = class_name
         return result
 
+    def _java_class_name(self, signature: str) -> str:
+        if not signature:
+            return ""
+        if signature.startswith("["):
+            return signature.replace("/", ".")
+        if signature.startswith("L") and signature.endswith(";"):
+            return signature[1:-1].replace("/", ".")
+        return signature.replace("/", ".")
+
+    def _semantic_value_base(
+        self,
+        obj_id: int,
+        kind: str,
+        signature: str,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._expanded_value_base(obj_id, kind)
+        result["_class"] = self._java_class_name(signature)
+        return result
+
+    def _mark_value_state(
+        self,
+        result: dict[str, Any],
+        state: str,
+        error: str,
+    ) -> dict[str, Any]:
+        result["value_state"] = state
+        result["error"] = error
+        return result
+
+    def _object_reference_type(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+    ) -> tuple[int, int, str]:
+        err, rt_data = jdwp.command(Cmd.OBJ_REF, 1, ids.pack_obj(obj_id))
+        if err:
+            return 0, 0, f"ObjectReference.ReferenceType failed (err {err})"
+        expected_len = 1 + ids.reference_type_id_size
+        if len(rt_data) < expected_len:
+            return 0, 0, "ObjectReference.ReferenceType reply too short"
+        type_tag = rt_data[0]
+        ref_type_id = int.from_bytes(
+            rt_data[1:1 + ids.reference_type_id_size],
+            "big",
+        )
+        return type_tag, ref_type_id, ""
+
+    def _reference_type_signature(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        ref_type_id: int,
+    ) -> tuple[str, str]:
+        err, sig_data = jdwp.command(Cmd.REF_TYPE, 1, ids.pack_ref(ref_type_id))
+        if err:
+            return "", f"ReferenceType.Signature failed (err {err})"
+        if len(sig_data) < 4:
+            return "", "ReferenceType.Signature reply too short"
+        slen = struct.unpack_from(">I", sig_data, 0)[0]
+        if len(sig_data) < 4 + slen:
+            return "", "ReferenceType.Signature reply truncated"
+        return sig_data[4:4 + slen].decode("utf-8"), ""
+
+    def _object_signature(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+    ) -> tuple[int, str, str]:
+        _type_tag, ref_type_id, error = self._object_reference_type(jdwp, ids, obj_id)
+        if error:
+            return 0, "", error
+        signature, error = self._reference_type_signature(jdwp, ids, ref_type_id)
+        if error:
+            return ref_type_id, "", error
+        return ref_type_id, signature, ""
+
+    def _declared_instance_fields(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        ref_type_id: int,
+    ) -> tuple[list[dict[str, Any]], str]:
+        err, f_data = jdwp.command(Cmd.REF_TYPE, 4, ids.pack_ref(ref_type_id))
+        if err:
+            return [], f"ReferenceType.Fields failed (err {err})"
+        if len(f_data) < 4:
+            return [], "ReferenceType.Fields reply too short"
+
+        field_count = struct.unpack_from(">I", f_data, 0)[0]
+        offset = 4
+        fields: list[dict[str, Any]] = []
+        try:
+            for _ in range(field_count):
+                fid = int.from_bytes(
+                    f_data[offset:offset + ids.field_id_size],
+                    "big",
+                )
+                offset += ids.field_id_size
+                nlen = struct.unpack_from(">I", f_data, offset)[0]
+                offset += 4
+                fname = f_data[offset:offset + nlen].decode("utf-8")
+                offset += nlen
+                slen = struct.unpack_from(">I", f_data, offset)[0]
+                offset += 4
+                fsig = f_data[offset:offset + slen].decode("utf-8")
+                offset += slen
+                mod_bits = struct.unpack_from(">I", f_data, offset)[0]
+                offset += 4
+                if self._is_instance_field(mod_bits):
+                    fields.append({
+                        "id": fid,
+                        "name": fname,
+                        "signature": fsig,
+                        "declaring_type_id": ref_type_id,
+                    })
+        except (IndexError, struct.error, UnicodeDecodeError) as exc:
+            return fields, f"ReferenceType.Fields decode failed: {exc}"
+        return fields, ""
+
+    def _superclass_id(self, jdwp: JDWPClient, ids, ref_type_id: int) -> int:
+        err, data = jdwp.command(Cmd.CLASS_TYPE, 1, ids.pack_ref(ref_type_id))
+        if err or len(data) < ids.reference_type_id_size:
+            return 0
+        return int.from_bytes(data[:ids.reference_type_id_size], "big")
+
+    def _instance_field_lookup(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        ref_type_id: int,
+    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+        lookup: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        seen: set[int] = set()
+        current = ref_type_id
+        while current and current not in seen:
+            seen.add(current)
+            fields, error = self._declared_instance_fields(jdwp, ids, current)
+            if error:
+                errors.append(error)
+            for field in fields:
+                lookup.setdefault(field["name"], field)
+            current = self._superclass_id(jdwp, ids, current)
+        return lookup, errors
+
+    def _read_raw_tagged_value(
+        self,
+        ids,
+        tag: int,
+        data: bytes,
+        offset: int,
+    ) -> tuple[dict[str, Any], int]:
+        if tag == Tag.DOUBLE:
+            return {"tag": tag, "value": struct.unpack_from(">d", data, offset)[0]}, offset + 8
+        if tag == Tag.FLOAT:
+            return {"tag": tag, "value": struct.unpack_from(">f", data, offset)[0]}, offset + 4
+        if tag == Tag.LONG:
+            return {"tag": tag, "value": struct.unpack_from(">q", data, offset)[0]}, offset + 8
+        if tag == Tag.BYTE:
+            return {"tag": tag, "value": struct.unpack_from(">b", data, offset)[0]}, offset + 1
+        if tag == Tag.BOOLEAN:
+            return {"tag": tag, "value": data[offset] != 0}, offset + 1
+        if tag == Tag.CHAR:
+            return {"tag": tag, "value": chr(struct.unpack_from(">H", data, offset)[0])}, offset + 2
+        if tag == Tag.SHORT:
+            return {"tag": tag, "value": struct.unpack_from(">h", data, offset)[0]}, offset + 2
+        if tag == Tag.INT:
+            return {"tag": tag, "value": struct.unpack_from(">i", data, offset)[0]}, offset + 4
+
+        obj_id = int.from_bytes(data[offset:offset + ids.object_id_size], "big")
+        return {"tag": tag, "value": obj_id}, offset + ids.object_id_size
+
+    def _expand_raw_tagged_value(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        raw: dict[str, Any],
+        depth: int,
+        visited: set[int],
+        *,
+        semantic_collections: bool,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> Any:
+        tag = int(raw.get("tag", 0))
+        value = raw.get("value")
+        if tag not in {
+            Tag.ARRAY,
+            Tag.OBJECT,
+            Tag.STRING,
+            Tag.THREAD,
+            Tag.THREAD_GROUP,
+            Tag.CLASS_LOADER,
+            Tag.CLASS_OBJECT,
+        }:
+            return value
+        obj_id = int(value or 0)
+        if obj_id == 0:
+            return None
+        payload = ids.pack_obj(obj_id)
+        expanded, _offset = self._read_value(
+            jdwp,
+            ids,
+            tag,
+            payload,
+            0,
+            depth=depth,
+            visited=visited,
+            semantic_collections=semantic_collections,
+            item_limit=item_limit,
+            map_entry_limit=map_entry_limit,
+        )
+        return expanded
+
+    def _read_named_fields_raw(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        field_lookup: dict[str, dict[str, Any]],
+        names: list[str],
+    ) -> tuple[dict[str, dict[str, Any]], str]:
+        missing = [name for name in names if name not in field_lookup]
+        selected = [field_lookup[name] for name in names if name in field_lookup]
+        if not selected:
+            return {}, f"Missing required field(s): {', '.join(missing)}"
+
+        payload = ids.pack_obj(obj_id) + struct.pack(">I", len(selected))
+        for field in selected:
+            payload += ids.pack_field(int(field["id"]))
+
+        err, values_data = jdwp.command(Cmd.OBJ_REF, 2, payload)
+        if err:
+            return {}, f"ObjectReference.GetValues failed (err {err})"
+        if len(values_data) < 4:
+            return {}, "ObjectReference.GetValues reply too short"
+
+        result: dict[str, dict[str, Any]] = {}
+        value_count = struct.unpack_from(">I", values_data, 0)[0]
+        offset = 4
+        try:
+            for index in range(min(value_count, len(selected))):
+                tag = values_data[offset]
+                offset += 1
+                raw, offset = self._read_raw_tagged_value(
+                    ids, tag, values_data, offset
+                )
+                result[selected[index]["name"]] = raw
+        except (IndexError, struct.error) as exc:
+            return result, f"ObjectReference.GetValues decode failed: {exc}"
+
+        errors = []
+        if missing:
+            errors.append(f"Missing field(s): {', '.join(missing)}")
+        if value_count < len(selected):
+            errors.append(
+                f"ObjectReference.GetValues returned {value_count} value(s) "
+                f"for {len(selected)} field(s)"
+            )
+        return result, "; ".join(errors)
+
     def _read_value(
         self,
         jdwp: JDWPClient,
@@ -2113,6 +2398,9 @@ class JavaRuntime(Runtime):
         offset: int,
         depth: int = 3,
         visited: set[int] | None = None,
+        semantic_collections: bool = True,
+        item_limit: int = 16,
+        map_entry_limit: int = 16,
     ):
         """Read a single JDWP tagged value. Returns (value, new_offset).
         depth: remaining object-expansion budget. Arrays and strings do not consume it."""
@@ -2161,7 +2449,16 @@ class JavaRuntime(Runtime):
             if obj_id in visited:
                 return self._reference_value(obj_id, "array"), offset
             visited.add(obj_id)
-            return self._read_array(jdwp, ids, obj_id, depth, visited), offset
+            return self._read_array(
+                jdwp,
+                ids,
+                obj_id,
+                depth,
+                visited,
+                semantic_collections=semantic_collections,
+                item_limit=item_limit,
+                map_entry_limit=map_entry_limit,
+            ), offset
 
         if depth <= 0:
             return self._reference_value(obj_id, "object"), offset
@@ -2172,7 +2469,16 @@ class JavaRuntime(Runtime):
         visited.add(obj_id)
 
         # tag == Tag.OBJECT (or anything else)
-        return self._read_object(jdwp, ids, obj_id, depth - 1, visited), offset
+        return self._read_object(
+            jdwp,
+            ids,
+            obj_id,
+            depth - 1,
+            visited,
+            semantic_collections=semantic_collections,
+            item_limit=item_limit,
+            map_entry_limit=map_entry_limit,
+        ), offset
 
     def _read_object(
         self,
@@ -2181,24 +2487,33 @@ class JavaRuntime(Runtime):
         obj_id: int,
         depth: int = 3,
         visited: set[int] | None = None,
+        semantic_collections: bool = True,
+        item_limit: int = 16,
+        map_entry_limit: int = 16,
     ) -> dict[str, Any]:
         """Read an object's class name and field values. Returns a structured dict."""
         try:
             if visited is None:
                 visited = set()
 
-            # Get the object's reference type
-            err, rt_data = jdwp.command(Cmd.OBJ_REF, 1, ids.pack_obj(obj_id))
-            if err:
-                return self._object_error_value(obj_id, error=f"ObjectReference.ReferenceType failed (err {err})")
-            ref_type_id = int.from_bytes(rt_data[1:1+ids.reference_type_id_size], "big")
+            ref_type_id, sig, error = self._object_signature(jdwp, ids, obj_id)
+            if error:
+                return self._object_error_value(obj_id, error=error)
 
-            # Get class signature
-            err, sig_data = jdwp.command(Cmd.REF_TYPE, 1, ids.pack_ref(ref_type_id))
-            if err:
-                return self._object_error_value(obj_id, error=f"ReferenceType.Signature failed (err {err})")
-            slen = struct.unpack_from(">I", sig_data, 0)[0]
-            sig = sig_data[4:4+slen].decode("utf-8")
+            if semantic_collections:
+                semantic_value = self._read_semantic_collection(
+                    jdwp,
+                    ids,
+                    obj_id,
+                    ref_type_id,
+                    sig,
+                    depth,
+                    visited,
+                    item_limit=item_limit,
+                    map_entry_limit=map_entry_limit,
+                )
+                if semantic_value is not None:
+                    return semantic_value
 
             # Get fields
             err, f_data = jdwp.command(Cmd.REF_TYPE, 4, ids.pack_ref(ref_type_id))
@@ -2248,11 +2563,592 @@ class JavaRuntime(Runtime):
                     break
                 _, fname, _fsig = fields[i]
                 tag = gv_data[gv_offset]; gv_offset += 1
-                val, gv_offset = self._read_value(jdwp, ids, tag, gv_data, gv_offset, depth, visited)
+                val, gv_offset = self._read_value(
+                    jdwp,
+                    ids,
+                    tag,
+                    gv_data,
+                    gv_offset,
+                    depth,
+                    visited,
+                    semantic_collections=semantic_collections,
+                    item_limit=item_limit,
+                    map_entry_limit=map_entry_limit,
+                )
                 result[fname] = val
             return result
         except Exception as e:
             return self._object_error_value(obj_id, error=str(e))
+
+    def _array_length(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        arr_id: int,
+    ) -> tuple[int, str]:
+        err, len_data = jdwp.command(Cmd.ARRAY, 1, ids.pack_obj(arr_id))
+        if err:
+            return 0, f"ArrayReference.Length failed (err {err})"
+        if len(len_data) < 4:
+            return 0, "ArrayReference.Length reply too short"
+        return struct.unpack_from(">I", len_data, 0)[0], ""
+
+    def _read_array_raw_values(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        arr_id: int,
+        requested_len: int,
+    ) -> tuple[list[dict[str, Any]], int, str]:
+        if requested_len <= 0:
+            return [], 0, ""
+        payload = ids.pack_obj(arr_id) + struct.pack(">II", 0, requested_len)
+        err, ev_data = jdwp.command(Cmd.ARRAY, 2, payload)
+        if err:
+            return [], 0, f"ArrayReference.GetValues failed (err {err})"
+        if len(ev_data) < 5:
+            return [], 0, "ArrayReference.GetValues reply too short"
+
+        element_tag = ev_data[0]
+        returned_count = struct.unpack_from(">I", ev_data, 1)[0]
+        offset = 5
+        read_len = min(returned_count, requested_len)
+        values: list[dict[str, Any]] = []
+        try:
+            for _ in range(read_len):
+                if self._array_elements_are_tagged(element_tag):
+                    tag = ev_data[offset]
+                    offset += 1
+                else:
+                    tag = element_tag
+                raw, offset = self._read_raw_tagged_value(ids, tag, ev_data, offset)
+                values.append(raw)
+        except (IndexError, struct.error) as exc:
+            return values, returned_count, f"ArrayReference.GetValues decode failed: {exc}"
+        return values, returned_count, ""
+
+    def _read_array_items(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        arr_id: int,
+        requested_len: int,
+        depth: int,
+        visited: set[int],
+        *,
+        semantic_collections: bool,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> tuple[list[Any], int, str]:
+        raw_values, returned_count, error = self._read_array_raw_values(
+            jdwp, ids, arr_id, requested_len
+        )
+        items = [
+            self._expand_raw_tagged_value(
+                jdwp,
+                ids,
+                raw,
+                depth,
+                visited,
+                semantic_collections=semantic_collections,
+                item_limit=item_limit,
+                map_entry_limit=map_entry_limit,
+            )
+            for raw in raw_values
+        ]
+        return items, returned_count, error
+
+    def _read_semantic_collection(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> dict[str, Any] | None:
+        class_name = self._java_class_name(signature)
+        if class_name == "java.util.ArrayList":
+            return self._read_array_list_semantic(
+                jdwp, ids, obj_id, ref_type_id, signature, depth, visited,
+                item_limit=item_limit, map_entry_limit=map_entry_limit,
+            )
+        if class_name == "java.util.LinkedList":
+            return self._read_linked_list_semantic(
+                jdwp, ids, obj_id, ref_type_id, signature, depth, visited,
+                item_limit=item_limit, map_entry_limit=map_entry_limit,
+            )
+        if class_name in {"java.util.HashMap", "java.util.LinkedHashMap"}:
+            return self._read_hash_map_semantic(
+                jdwp, ids, obj_id, ref_type_id, signature, depth, visited,
+                entry_limit=map_entry_limit, item_limit=item_limit,
+            )
+        if class_name in {"java.util.HashSet", "java.util.LinkedHashSet"}:
+            return self._read_hash_set_semantic(
+                jdwp, ids, obj_id, ref_type_id, signature, depth, visited,
+                item_limit=item_limit, map_entry_limit=map_entry_limit,
+            )
+        if class_name == "java.util.Optional":
+            return self._read_optional_semantic(
+                jdwp, ids, obj_id, ref_type_id, signature, depth, visited,
+                item_limit=item_limit, map_entry_limit=map_entry_limit,
+            )
+        return None
+
+    def _raw_int_value(self, raw: dict[str, Any] | None) -> int | None:
+        if raw is None:
+            return None
+        if int(raw.get("tag", 0)) == Tag.INT and isinstance(raw.get("value"), int):
+            return int(raw["value"])
+        return None
+
+    def _raw_object_id(self, raw: dict[str, Any] | None) -> int:
+        if raw is None:
+            return 0
+        if int(raw.get("tag", 0)) in {
+            Tag.ARRAY,
+            Tag.OBJECT,
+            Tag.STRING,
+            Tag.THREAD,
+            Tag.THREAD_GROUP,
+            Tag.CLASS_LOADER,
+            Tag.CLASS_OBJECT,
+        }:
+            return int(raw.get("value") or 0)
+        return 0
+
+    def _read_array_list_semantic(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> dict[str, Any]:
+        result = self._semantic_value_base(obj_id, "list", signature)
+        result.update({
+            "size": None,
+            "items": [],
+            "truncated": False,
+            "item_limit": item_limit,
+        })
+        fields, lookup_errors = self._instance_field_lookup(jdwp, ids, ref_type_id)
+        raw, error = self._read_named_fields_raw(
+            jdwp, ids, obj_id, fields, ["size", "elementData"]
+        )
+        size = self._raw_int_value(raw.get("size"))
+        if size is None:
+            return self._mark_value_state(
+                result,
+                "unavailable",
+                error or "ArrayList.size field was not readable",
+            )
+        result["size"] = size
+        limit = min(size, item_limit)
+        result["truncated"] = size > limit
+        if lookup_errors and not error:
+            error = "; ".join(lookup_errors)
+        if size == 0 or limit == 0:
+            if error:
+                self._mark_value_state(result, "partial", error)
+            return result
+
+        element_data_id = self._raw_object_id(raw.get("elementData"))
+        if element_data_id == 0:
+            return self._mark_value_state(
+                result,
+                "unavailable",
+                error or "ArrayList.elementData was null or unreadable",
+            )
+        array_len, array_error = self._array_length(jdwp, ids, element_data_id)
+        if array_error:
+            return self._mark_value_state(result, "unavailable", array_error)
+
+        requested_len = min(limit, array_len)
+        items, returned_count, items_error = self._read_array_items(
+            jdwp,
+            ids,
+            element_data_id,
+            requested_len,
+            depth,
+            visited,
+            semantic_collections=True,
+            item_limit=item_limit,
+            map_entry_limit=map_entry_limit,
+        )
+        result["items"] = items
+        errors = [message for message in (error, items_error) if message]
+        if array_len < limit:
+            errors.append(
+                f"ArrayList.elementData length {array_len} is smaller than size {size}"
+            )
+        if returned_count != requested_len:
+            errors.append(
+                f"ArrayReference.GetValues returned {returned_count} value(s), "
+                f"expected {requested_len}"
+            )
+        if errors:
+            self._mark_value_state(result, "partial" if items else "unavailable", "; ".join(errors))
+        return result
+
+    def _read_linked_list_semantic(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> dict[str, Any]:
+        result = self._semantic_value_base(obj_id, "list", signature)
+        result.update({
+            "size": None,
+            "items": [],
+            "truncated": False,
+            "item_limit": item_limit,
+        })
+        fields, lookup_errors = self._instance_field_lookup(jdwp, ids, ref_type_id)
+        raw, error = self._read_named_fields_raw(
+            jdwp, ids, obj_id, fields, ["size", "first"]
+        )
+        size = self._raw_int_value(raw.get("size"))
+        if size is None:
+            return self._mark_value_state(
+                result,
+                "unavailable",
+                error or "LinkedList.size field was not readable",
+            )
+        result["size"] = size
+        limit = min(size, item_limit)
+        result["truncated"] = size > limit
+        if lookup_errors and not error:
+            error = "; ".join(lookup_errors)
+        if size == 0 or limit == 0:
+            if error:
+                self._mark_value_state(result, "partial", error)
+            return result
+
+        node_id = self._raw_object_id(raw.get("first"))
+        if node_id == 0:
+            return self._mark_value_state(
+                result,
+                "unavailable",
+                error or "LinkedList.first was null before size items were read",
+            )
+
+        items: list[Any] = []
+        errors = [message for message in (error,) if message]
+        seen_nodes: set[int] = set()
+        while node_id and len(items) < limit:
+            if node_id in seen_nodes:
+                errors.append("LinkedList node cycle detected")
+                break
+            seen_nodes.add(node_id)
+            node_ref_type_id, _node_sig, node_error = self._object_signature(
+                jdwp, ids, node_id
+            )
+            if node_error:
+                errors.append(node_error)
+                break
+            node_fields, node_lookup_errors = self._instance_field_lookup(
+                jdwp, ids, node_ref_type_id
+            )
+            errors.extend(node_lookup_errors)
+            node_raw, node_read_error = self._read_named_fields_raw(
+                jdwp, ids, node_id, node_fields, ["item", "next"]
+            )
+            if node_read_error:
+                errors.append(node_read_error)
+            if "item" not in node_raw:
+                break
+            items.append(self._expand_raw_tagged_value(
+                jdwp,
+                ids,
+                node_raw["item"],
+                depth,
+                visited,
+                semantic_collections=True,
+                item_limit=item_limit,
+                map_entry_limit=map_entry_limit,
+            ))
+            node_id = self._raw_object_id(node_raw.get("next"))
+
+        result["items"] = items
+        if len(items) < limit:
+            errors.append(f"LinkedList traversal returned {len(items)} item(s), expected {limit}")
+        if errors:
+            self._mark_value_state(result, "partial" if items else "unavailable", "; ".join(errors))
+        return result
+
+    def _read_hash_map_semantic(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        entry_limit: int,
+        item_limit: int,
+    ) -> dict[str, Any]:
+        result = self._semantic_value_base(obj_id, "map", signature)
+        result.update({
+            "size": None,
+            "entries": [],
+            "truncated": False,
+            "entry_limit": entry_limit,
+        })
+        entries, size, truncated, state, error = self._read_hash_map_entries(
+            jdwp,
+            ids,
+            obj_id,
+            ref_type_id,
+            depth,
+            visited,
+            entry_limit=entry_limit,
+            item_limit=item_limit,
+        )
+        result["size"] = size
+        result["entries"] = entries
+        result["truncated"] = truncated
+        if state:
+            self._mark_value_state(result, state, error)
+        return result
+
+    def _read_hash_set_semantic(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> dict[str, Any]:
+        result = self._semantic_value_base(obj_id, "set", signature)
+        result.update({
+            "size": None,
+            "items": [],
+            "truncated": False,
+            "item_limit": item_limit,
+        })
+        fields, lookup_errors = self._instance_field_lookup(jdwp, ids, ref_type_id)
+        raw, error = self._read_named_fields_raw(jdwp, ids, obj_id, fields, ["map"])
+        map_id = self._raw_object_id(raw.get("map"))
+        if map_id == 0:
+            message = error or "HashSet.map field was null or unreadable"
+            if lookup_errors:
+                message = "; ".join([message, *lookup_errors])
+            return self._mark_value_state(result, "unavailable", message)
+
+        map_ref_type_id, _map_sig, map_error = self._object_signature(jdwp, ids, map_id)
+        if map_error:
+            return self._mark_value_state(result, "unavailable", map_error)
+        entries, size, truncated, state, map_entries_error = self._read_hash_map_entries(
+            jdwp,
+            ids,
+            map_id,
+            map_ref_type_id,
+            depth,
+            visited | {map_id},
+            entry_limit=item_limit,
+            item_limit=item_limit,
+        )
+        result["size"] = size
+        result["items"] = [entry["key"] for entry in entries]
+        result["truncated"] = truncated
+        errors = [message for message in (error, map_entries_error) if message]
+        errors.extend(lookup_errors)
+        if state or errors:
+            self._mark_value_state(
+                result,
+                state or "partial",
+                "; ".join(errors) if errors else map_entries_error,
+            )
+        return result
+
+    def _read_optional_semantic(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        obj_id: int,
+        ref_type_id: int,
+        signature: str,
+        depth: int,
+        visited: set[int],
+        *,
+        item_limit: int,
+        map_entry_limit: int,
+    ) -> dict[str, Any]:
+        result = self._semantic_value_base(obj_id, "optional", signature)
+        fields, lookup_errors = self._instance_field_lookup(jdwp, ids, ref_type_id)
+        raw, error = self._read_named_fields_raw(jdwp, ids, obj_id, fields, ["value"])
+        if "value" not in raw:
+            message = error or "Optional.value field was not readable"
+            if lookup_errors:
+                message = "; ".join([message, *lookup_errors])
+            result["present"] = None
+            return self._mark_value_state(result, "unavailable", message)
+        value_id = self._raw_object_id(raw["value"])
+        result["present"] = value_id != 0
+        if value_id == 0:
+            result["value"] = None
+            return result
+        result["value"] = self._expand_raw_tagged_value(
+            jdwp,
+            ids,
+            raw["value"],
+            depth,
+            visited,
+            semantic_collections=True,
+            item_limit=item_limit,
+            map_entry_limit=map_entry_limit,
+        )
+        if error or lookup_errors:
+            self._mark_value_state(
+                result,
+                "partial",
+                "; ".join([message for message in [error, *lookup_errors] if message]),
+            )
+        return result
+
+    def _read_hash_map_entries(
+        self,
+        jdwp: JDWPClient,
+        ids,
+        map_id: int,
+        ref_type_id: int,
+        depth: int,
+        visited: set[int],
+        *,
+        entry_limit: int,
+        item_limit: int,
+    ) -> tuple[list[dict[str, Any]], int | None, bool, str, str]:
+        fields, lookup_errors = self._instance_field_lookup(jdwp, ids, ref_type_id)
+        raw, error = self._read_named_fields_raw(
+            jdwp, ids, map_id, fields, ["size", "table"]
+        )
+        size = self._raw_int_value(raw.get("size"))
+        if size is None:
+            message = error or "HashMap.size field was not readable"
+            if lookup_errors:
+                message = "; ".join([message, *lookup_errors])
+            return [], None, False, "unavailable", message
+
+        limit = min(size, entry_limit)
+        truncated = size > limit
+        if size == 0 or limit == 0:
+            return [], size, truncated, "", error or "; ".join(lookup_errors)
+
+        table_id = self._raw_object_id(raw.get("table"))
+        if table_id == 0:
+            message = error or "HashMap.table field was null or unreadable"
+            if lookup_errors:
+                message = "; ".join([message, *lookup_errors])
+            return [], size, truncated, "unavailable", message
+
+        table_len, table_error = self._array_length(jdwp, ids, table_id)
+        if table_error:
+            return [], size, truncated, "unavailable", table_error
+
+        bucket_scan_limit = min(
+            table_len,
+            max(self._max_array_elements, entry_limit * 4, 16),
+        )
+        bucket_raw_values, returned_count, bucket_error = self._read_array_raw_values(
+            jdwp, ids, table_id, bucket_scan_limit
+        )
+        entries: list[dict[str, Any]] = []
+        errors = [message for message in (error, bucket_error) if message]
+        errors.extend(lookup_errors)
+        if returned_count != bucket_scan_limit:
+            errors.append(
+                f"HashMap.table returned {returned_count} bucket(s), "
+                f"expected {bucket_scan_limit}"
+            )
+
+        seen_nodes: set[int] = set()
+        for bucket in bucket_raw_values:
+            node_id = self._raw_object_id(bucket)
+            while node_id and len(entries) < limit:
+                if node_id in seen_nodes:
+                    errors.append("HashMap node cycle detected")
+                    node_id = 0
+                    break
+                seen_nodes.add(node_id)
+                node_ref_type_id, _node_sig, node_error = self._object_signature(
+                    jdwp, ids, node_id
+                )
+                if node_error:
+                    errors.append(node_error)
+                    break
+                node_fields, node_lookup_errors = self._instance_field_lookup(
+                    jdwp, ids, node_ref_type_id
+                )
+                errors.extend(node_lookup_errors)
+                node_raw, node_read_error = self._read_named_fields_raw(
+                    jdwp, ids, node_id, node_fields, ["key", "value", "next"]
+                )
+                if node_read_error:
+                    errors.append(node_read_error)
+                if "key" not in node_raw or "value" not in node_raw:
+                    break
+                entries.append({
+                    "key": self._expand_raw_tagged_value(
+                        jdwp,
+                        ids,
+                        node_raw["key"],
+                        depth,
+                        visited,
+                        semantic_collections=True,
+                        item_limit=item_limit,
+                        map_entry_limit=entry_limit,
+                    ),
+                    "value": self._expand_raw_tagged_value(
+                        jdwp,
+                        ids,
+                        node_raw["value"],
+                        depth,
+                        visited,
+                        semantic_collections=True,
+                        item_limit=item_limit,
+                        map_entry_limit=entry_limit,
+                    ),
+                })
+                node_id = self._raw_object_id(node_raw.get("next"))
+            if len(entries) >= limit:
+                break
+
+        if bucket_scan_limit < table_len and len(entries) < limit:
+            errors.append(
+                f"HashMap.table scan capped at {bucket_scan_limit}/{table_len} buckets"
+            )
+        if len(entries) < limit:
+            errors.append(
+                f"HashMap traversal returned {len(entries)} entry(s), expected {limit}"
+            )
+        state = "partial" if errors else ""
+        if not entries and size > 0 and errors:
+            state = "unavailable"
+        return entries, size, truncated, state, "; ".join(errors)
 
     def _read_array(
         self,
@@ -2261,23 +3157,72 @@ class JavaRuntime(Runtime):
         arr_id: int,
         depth: int = 3,
         visited: set[int] | None = None,
+        semantic_collections: bool = True,
+        item_limit: int = 16,
+        map_entry_limit: int = 16,
     ) -> dict:
-        """Read an array's length and elements. Returns dict with _length and elements list."""
+        """Read an array's length and elements."""
         try:
             if visited is None:
                 visited = set()
 
+            _ref_type_id, signature, signature_error = self._object_signature(
+                jdwp, ids, arr_id
+            )
+
             # Get length
             err, len_data = jdwp.command(Cmd.ARRAY, 1, ids.pack_obj(arr_id))
             if err:
+                if semantic_collections:
+                    result = self._semantic_value_base(arr_id, "array", signature)
+                    result["length"] = None
+                    result["items"] = []
+                    result["truncated"] = False
+                    result["item_limit"] = item_limit
+                    return self._mark_value_state(
+                        result, "unavailable", f"ArrayReference.Length failed (err {err})"
+                    )
                 result: dict[str, Any] = self._expanded_value_base(arr_id, "array")
                 result["_length"] = "?"
                 result["_error"] = f"length failed (err {err})"
                 return result
             total_len = struct.unpack_from(">I", len_data, 0)[0]
 
+            if semantic_collections:
+                result = self._semantic_value_base(arr_id, "array", signature)
+                result["length"] = total_len
+                result["items"] = []
+                result["truncated"] = total_len > item_limit
+                result["item_limit"] = item_limit
+                if signature_error:
+                    self._mark_value_state(result, "partial", signature_error)
+                if total_len == 0 or item_limit == 0:
+                    return result
+
+                requested_len = min(total_len, item_limit)
+                items, returned_count, error = self._read_array_items(
+                    jdwp,
+                    ids,
+                    arr_id,
+                    requested_len,
+                    depth,
+                    visited,
+                    semantic_collections=semantic_collections,
+                    item_limit=item_limit,
+                    map_entry_limit=map_entry_limit,
+                )
+                result["items"] = items
+                if error or returned_count != requested_len:
+                    message = error or (
+                        f"ArrayReference.GetValues returned {returned_count} "
+                        f"value(s), expected {requested_len}"
+                    )
+                    state = "partial" if items else "unavailable"
+                    self._mark_value_state(result, state, message)
+                return result
+
             if total_len == 0:
-                result: dict[str, Any] = self._expanded_value_base(arr_id, "array")
+                result = self._expanded_value_base(arr_id, "array")
                 result["_length"] = 0
                 result["elements"] = []
                 return result
@@ -2285,38 +3230,23 @@ class JavaRuntime(Runtime):
             requested_len = min(total_len, self._max_array_elements)
 
             # Read all elements (JDWP GetValues: firstIndex=0, length=arr_len)
-            payload = ids.pack_obj(arr_id) + struct.pack(">II", 0, requested_len)
-            err, ev_data = jdwp.command(Cmd.ARRAY, 2, payload)
-            if err:
-                result: dict[str, Any] = self._expanded_value_base(arr_id, "array")
-                result["_length"] = total_len
-                result["_error"] = f"getValues failed (err {err})"
-                return result
-
-            if len(ev_data) < 5:
-                result: dict[str, Any] = self._expanded_value_base(arr_id, "array")
-                result["_length"] = total_len
-                result["_error"] = "arrayregion reply too short"
-                return result
-
-            element_tag = ev_data[0]
-            returned_count = struct.unpack_from(">I", ev_data, 1)[0]
-            gv_offset = 5
-            read_len = min(returned_count, requested_len)
-
-            elements = []
-            for _ in range(read_len):
-                if self._array_elements_are_tagged(element_tag):
-                    tag = ev_data[gv_offset]
-                    gv_offset += 1
-                else:
-                    tag = element_tag
-                val, gv_offset = self._read_value(jdwp, ids, tag, ev_data, gv_offset, depth, visited)
-                elements.append(val)
+            elements, returned_count, error = self._read_array_items(
+                jdwp,
+                ids,
+                arr_id,
+                requested_len,
+                depth,
+                visited,
+                semantic_collections=semantic_collections,
+                item_limit=item_limit,
+                map_entry_limit=map_entry_limit,
+            )
 
             result: dict[str, Any] = self._expanded_value_base(arr_id, "array")
             result["_length"] = total_len
             result["elements"] = elements
+            if error:
+                result["_error"] = error
             if total_len > requested_len:
                 result["_truncated"] = True
                 result["_remaining_count"] = total_len - requested_len

@@ -241,6 +241,30 @@ JAVA_RUNTIME_SCHEMA = {
                     "and array metadata remain readable."
                 ),
             },
+            "semantic_collections": {
+                "type": "boolean", "default": True,
+                "description": (
+                    "Used by action='variables'. Defaults to true so Java arrays, "
+                    "ArrayList, LinkedList, HashMap, LinkedHashMap, HashSet, "
+                    "LinkedHashSet, and Optional are rendered as logical structures "
+                    "instead of JDK internal fields. Set false to inspect raw fields "
+                    "such as elementData/table/map."
+                ),
+            },
+            "item_limit": {
+                "type": "integer", "minimum": 0, "maximum": 64, "default": 16,
+                "description": (
+                    "Used by action='variables' when semantic_collections=true. "
+                    "Maximum array/list/set items returned. Default: 16."
+                ),
+            },
+            "map_entry_limit": {
+                "type": "integer", "minimum": 0, "maximum": 64, "default": 16,
+                "description": (
+                    "Used by action='variables' when semantic_collections=true. "
+                    "Maximum map entries returned. Default: 16."
+                ),
+            },
             "timeout": {
                 "type": "number", "minimum": 0.1, "maximum": 300, "default": 30,
                 "description": "Seconds to wait for a debug event. Default: 30.",
@@ -320,6 +344,9 @@ def _handle_java_runtime(args: dict, **kw) -> str:
         max_frames=args.get("max_frames", 20),
         include_this=_bool_arg(args, "include_this", False),
         max_value_depth=int(args.get("max_value_depth", 1)),
+        semantic_collections=_bool_arg(args, "semantic_collections", True),
+        item_limit=int(args.get("item_limit", 16)),
+        map_entry_limit=int(args.get("map_entry_limit", 16)),
         timeout=float(args.get("timeout", 30)),
         suspension_id=args.get("suspension_id", ""),
     )

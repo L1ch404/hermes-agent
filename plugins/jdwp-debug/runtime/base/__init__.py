@@ -87,6 +87,9 @@ class RuntimeAction:
     max_frames: int = 20
     include_this: bool = False
     max_value_depth: int = 1
+    semantic_collections: bool = True
+    item_limit: int = 16
+    map_entry_limit: int = 16
     timeout: float = 30.0
     suspension_id: str = ""
 

@@ -73,6 +73,7 @@ class IDSizes:
 class Cmd:
     VM          = 1
     REF_TYPE    = 2
+    CLASS_TYPE  = 3
     METHOD      = 6
     OBJ_REF     = 9   # ObjectReference
     STRING_REF  = 10  # StringReference
