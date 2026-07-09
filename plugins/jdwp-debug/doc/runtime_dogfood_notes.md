@@ -885,3 +885,26 @@ complex async workflows
 - How should Runtime associate a request, breakpoint hit, logs, and variables into one debug episode?
 - Should Runtime expose nearby logs around the breakpoint time?
 - What is the smallest benchmark that can test this full flow?
+
+
+# Case-002 Runtime-assisted Code Reading
+
+## 目标
+验证 Runtime 是否能辅助 LLM 在不大量静态读源码的情况下理解一次 HTTP 请求链路。
+
+## 方法
+触发公司项目随机 API，通过断点暂停请求线程，读取 30 层 stack，并在多个 frame_index 上读取 variables。
+
+## 结果
+- stack 展示 NIO socket → CoyoteAdapter → Tomcat Valve → Filter chain → Controller 的完整路径。
+- SpringBootFilter frame 中观察到 requestId、sessionid、isDebug、requestWrapper body。
+- CORSFilter frame 中通过变量确认其标准 CORS 过滤职责。
+- stack + frame variables 能帮助 LLM 快速理解请求链路和中间层行为。
+
+## 发现的问题
+- SUSPEND_ALL 多轮后会残留，导致新请求断点不命中。
+- 多断点 + 多请求并发需要精确 request_id 管理。
+- exception event 对 NPE 定位效率远高于逐行断点。
+
+## 结论
+Runtime 不只适合 Debug，也适合运行时辅助读代码。
