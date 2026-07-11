@@ -58,6 +58,62 @@ from hermes_test_jdwp_debug.runtime.java.runtime import (  # noqa: E402
 )
 
 
+def test_plugin_registers_java_runtime_tool_and_skill() -> None:
+    registered_tools = []
+    registered_skills = []
+
+    class FakeContext:
+        def register_tool(self, **kwargs):
+            registered_tools.append(kwargs)
+
+        def register_skill(self, name, path, description=""):
+            registered_skills.append((name, path, description))
+
+    plugin_module.register(FakeContext())
+
+    assert [tool["name"] for tool in registered_tools] == ["java_runtime"]
+    assert "java-runtime:observation" in registered_tools[0]["schema"]["description"]
+    assert len(registered_skills) == 1
+    skill_name, skill_path, skill_description = registered_skills[0]
+    assert skill_name == "observation"
+    assert skill_path == PLUGIN_ROOT / "skills" / "observation" / "SKILL.md"
+    assert skill_path.is_file()
+    skill_content = skill_path.read_text(encoding="utf-8")
+    assert "Distinguish facts, inferences, and unknowns" in skill_content
+    assert "`request_id` for exception events" in skill_content
+    assert "application behavior" in skill_description
+
+
+def test_java_runtime_schema_documents_runtime_evidence_boundaries() -> None:
+    schema = plugin_module.JAVA_RUNTIME_SCHEMA
+    description = schema["description"]
+    properties = schema["parameters"]["properties"]
+
+    assert "value_state='observed'" in description
+    assert "value_state='partial'" in description
+    assert "value_state='unavailable'" in description
+
+    action_description = properties["action"]["description"]
+    logs_description = properties["tail"]["description"]
+    assert "externally attached JVM" in action_description
+    assert "must not be used as evidence" in action_description
+    assert "attached JVM's stdout/stderr is not captured" in logs_description
+
+    thread_description = properties["thread_name"]["description"]
+    assert "currently suspended thread" in thread_description
+    assert "suspended=true" in thread_description
+
+    host_description = properties["host"]["description"]
+    assert "localhost" in host_description
+    assert "127.0.0.1" in host_description
+    assert "::1" not in host_description
+
+    request_id_description = properties["request_id"]["description"]
+    assert "breakpoint-hit" in request_id_description
+    assert "top level" in request_id_description
+    assert "Prefer breakpoint_id" in request_id_description
+
+
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
     result = b""
     while len(result) < size:
