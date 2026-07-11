@@ -36,6 +36,7 @@ export interface ThemeColors {
 
 export interface ThemeBrand {
   name: string
+  tagline: string
   icon: string
   prompt: string
   welcome: string
@@ -234,11 +235,12 @@ function normalizeAnsiForeground(color: string): string {
 // ── Defaults ─────────────────────────────────────────────────────────
 
 const BRAND: ThemeBrand = {
-  name: 'Hermes Agent',
-  icon: '⚕',
+  name: 'joLink',
+  tagline: 'Runtime evidence for coding agents',
+  icon: '',
   prompt: '❯',
   welcome: 'Type your message or /help for commands.',
-  goodbye: 'Goodbye! ⚕',
+  goodbye: 'Goodbye from joLink!',
   tool: '┊',
   helpHeader: '(^_^)? Commands'
 }
@@ -576,6 +578,7 @@ export function fromSkin(
 
       brand: {
         name: branding.agent_name ?? d.brand.name,
+        tagline: branding.tagline ?? d.brand.tagline,
         icon: d.brand.icon,
         prompt: cleanPromptSymbol(branding.prompt_symbol, d.brand.prompt),
         welcome: branding.welcome ?? d.brand.welcome,

@@ -83,6 +83,31 @@ requires them.
 - If a port is already occupied or an earlier process may still be alive,
   inspect `status` and the local process state before repeatedly calling `run`.
 
+### Preparing a trigger request
+
+Before triggering an endpoint, determine the target environment, application
+host and port, base path, readiness state, HTTP method, authentication, and
+required parameters.
+
+Prefer to derive the request from controllers, DTOs, frontend call sites,
+OpenAPI documentation, tests, or existing examples. Do not invent required
+identifiers, credentials, or production business data. Synthetic data is
+acceptable only in a clearly disposable local or test environment.
+
+If required runtime values such as a token, user ID, or task ID remain unknown,
+ask the user only for the missing information.
+
+Before triggering production writes or operations with destructive,
+irreversible, or external side effects, obtain explicit user confirmation or
+ask the user to trigger the operation manually.
+
+Prefer an existing authenticated client or temporary, test-only,
+least-privileged credentials. Do not extract and reuse credentials from logs or
+Runtime observations, and do not unnecessarily expose full credential values.
+
+Trigger requests that may hit a breakpoint through a non-blocking mechanism,
+such as `background=true`. If credentials cannot be safely provided, ask the
+user to trigger the scenario manually.
 
 ## 1. Distinguish facts, inferences, and unknowns
 

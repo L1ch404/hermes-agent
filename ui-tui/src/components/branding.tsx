@@ -44,9 +44,6 @@ export function ArtLines({ lines }: { lines: [string, string][] }) {
 // Terminals can't scale glyphs, so "responsive" means picking a layout that
 // fits the available columns. Thresholds are picked so each tier reads
 // comfortably without forcing wrap or truncation drift on box-drawing edges.
-const TAG_FULL = 'Nous Research · Messenger of the Digital Gods'
-const TAG_MID = 'Messenger of the Digital Gods'
-const TAG_TINY = 'Nous Research'
 const HIDE_BELOW = 34
 const COMPACT_FROM = 58
 
@@ -77,7 +74,7 @@ function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
       <Text bold color={t.color.primary}>
         {ruleIn(t.brand.name, w)}
       </Text>
-      <Text color={t.color.muted}>{centerIn(TAG_FULL, w)}</Text>
+      <Text color={t.color.muted}>{centerIn(t.brand.tagline, w)}</Text>
       <Text color={t.color.primary}>{'─'.repeat(w)}</Text>
     </Box>
   )
@@ -99,7 +96,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
       <Box flexDirection="column" marginBottom={1}>
         <ArtLines lines={logoLines} />
         <Text color={t.color.muted} wrap="truncate-end">
-          {t.brand.icon} {TAG_FULL}
+          {t.brand.tagline}
         </Text>
       </Box>
     )
@@ -110,15 +107,14 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
   }
 
   const name = cols >= 52 ? t.brand.name : (t.brand.name.split(' ')[0] ?? t.brand.name)
-  const tag = cols >= 64 ? TAG_FULL : cols >= 46 ? TAG_MID : TAG_TINY
 
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Text bold color={t.color.primary} wrap="truncate-end">
-        {t.brand.icon} {name}
+        {name}
       </Text>
       <Text color={t.color.muted} wrap="truncate-end">
-        {t.brand.icon} {tag}
+        {t.brand.tagline}
       </Text>
     </Box>
   )
@@ -291,7 +287,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
           <Text color={t.color.accent}>
             {info.model.split('/').pop()}
-            <Text color={t.color.muted}> · Nous Research</Text>
+            <Text color={t.color.muted}> · {t.brand.name}</Text>
           </Text>
 
           <Text color={t.color.muted} wrap="truncate-end">
@@ -322,7 +318,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
           <Box flexDirection="column" marginBottom={1}>
             <Text color={t.color.accent} wrap="truncate-end">
               {info.model.split('/').pop()}
-              <Text color={t.color.muted}> · Nous Research</Text>
+              <Text color={t.color.muted}> · {t.brand.name}</Text>
             </Text>
             <Text color={t.color.muted} wrap="truncate-end">
               {info.cwd || process.cwd()}

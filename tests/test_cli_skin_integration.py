@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from rich.markup import render
+
 from cli import HermesCLI, _build_compact_banner, _rich_text_from_ansi
 from hermes_cli.skin_engine import get_active_skin, set_active_skin
 
@@ -92,31 +94,47 @@ class TestCliSkinPromptIntegration:
 
 
 class TestCompactBannerSkinIntegration:
-    def test_default_compact_banner_keeps_legacy_nous_hermes_branding(self):
+    def test_default_skin_renders_exact_jolink_logo_and_tagline(self):
+        set_active_skin("default")
+        skin = get_active_skin()
+
+        assert render(skin.banner_logo).plain == (
+            "       _       _     _       _\n"
+            "      (_) ___ | |   (_)_ __ | | __\n"
+            "      | |/ _ \\| |   | | '_ \\| |/ /\n"
+            "      | | (_) | |___| | | | |   <\n"
+            "     _/ |\\___/|_____|_|_| |_|_|\\_\\\n"
+            "    |__/"
+        )
+        assert skin.get_branding("agent_name") == "joLink"
+        assert skin.get_branding("tagline") == "Runtime evidence for coding agents"
+
+    def test_default_compact_banner_uses_jolink_branding(self):
         set_active_skin("default")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "joLink v0.1.0 (test)"}):
             banner = _build_compact_banner()
 
-        assert "NOUS HERMES" in banner
+        assert "joLink" in banner
+        assert "Runtime evidence for coding agents" in banner
 
     def test_poseidon_compact_banner_uses_skin_branding_instead_of_nous_hermes(self):
         set_active_skin("poseidon")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "joLink v0.1.0 (test)"}):
             banner = _build_compact_banner()
 
         assert "Poseidon Agent" in banner
-        assert "NOUS HERMES" not in banner
+        assert "Poseidon Agent - Runtime evidence for coding agents" in banner
 
     def test_poseidon_compact_banner_uses_skin_colors(self):
         set_active_skin("poseidon")
         skin = get_active_skin()
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v0.1.0 (test)"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "joLink v0.1.0 (test)"}):
             banner = _build_compact_banner()
 
         assert skin.get_color("banner_border") in banner
@@ -127,7 +145,7 @@ class TestCompactBannerSkinIntegration:
         set_active_skin("default")
 
         with patch("cli.shutil.get_terminal_size", return_value=SimpleNamespace(columns=90)), \
-             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "Hermes Agent v1.0 (test) · upstream abc12345"}):
+             patch.dict(_build_compact_banner.__globals__, {"format_banner_version_label": lambda: "joLink v1.0 (test) · upstream abc12345"}):
             banner = _build_compact_banner()
 
         assert "upstream abc12345" in banner

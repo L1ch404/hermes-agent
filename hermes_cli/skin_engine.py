@@ -65,10 +65,10 @@ All fields are optional. Missing values inherit from the ``default`` skin.
 
     # Branding: text strings used throughout the CLI
     branding:
-      agent_name: "Hermes Agent"          # Banner title, status display
+      agent_name: "joLink"                # Banner title, status display
       welcome: "Welcome message"          # Shown at CLI startup
-      goodbye: "Goodbye! ⚕"              # Shown on exit
-      response_label: " ⚕ Hermes "       # Response box header label
+      goodbye: "Goodbye from joLink!"      # Shown on exit
+      response_label: " joLink "            # Response box header label
       prompt_symbol: "❯"                 # Input prompt symbol (bare token; renderers add trailing space)
       help_header: "(^_^)? Commands"      # /help header text
 
@@ -90,7 +90,7 @@ USAGE
 
     skin = get_active_skin()
     print(skin.colors["banner_title"])    # "#FFD700"
-    print(skin.get_branding("agent_name"))  # "Hermes Agent"
+    print(skin.get_branding("agent_name"))  # "joLink"
 
     set_active_skin("ares")               # Switch to built-in ares skin
     set_active_skin("mytheme")            # Switch to user skin from ~/.hermes/skins/
@@ -164,7 +164,7 @@ class SkinConfig:
 _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
     "default": {
         "name": "default",
-        "description": "Classic Hermes — gold and kawaii",
+        "description": "joLink — Runtime evidence for coding agents",
         "colors": {
             "banner_border": "#CD7F32",
             "banner_title": "#FFD700",
@@ -187,13 +187,23 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             # Empty = use hardcoded defaults in display.py
         },
         "branding": {
-            "agent_name": "Hermes Agent",
-            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
-            "goodbye": "Goodbye! ⚕",
-            "response_label": " ⚕ Hermes ",
+            "agent_name": "joLink",
+            "tagline": "Runtime evidence for coding agents",
+            "welcome": "Welcome to joLink! Type your message or /help for commands.",
+            "goodbye": "Goodbye from joLink!",
+            "response_label": " joLink ",
             "prompt_symbol": "❯",
             "help_header": "(^_^)? Available Commands",
         },
+        "banner_logo": r"""[bold #FFD700]       _       _     _       _[/]
+[bold #FFD700]      (_) ___ | |   (_)_ __ | | __[/]
+[#FFBF00]      | |/ _ \| |   | | '_ \| |/ /[/]
+[#FFBF00]      | | (_) | |___| | | | |   <[/]
+[#CD7F32]     _/ |\___/|_____|_|_| |_|_|\_\\[/]
+[#CD7F32]    |__/[/]""",
+        "banner_hero": """[bold #FFD700]joLink[/]
+[#B8860B]Runtime evidence[/]
+[#B8860B]for coding agents[/]""",
         "tool_prefix": "┊",
     },
     "ares": {
@@ -298,10 +308,11 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
         },
         "spinner": {},
         "branding": {
-            "agent_name": "Hermes Agent",
-            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
-            "goodbye": "Goodbye! ⚕",
-            "response_label": " ⚕ Hermes ",
+            "agent_name": "joLink",
+            "tagline": "Runtime evidence for coding agents",
+            "welcome": "Welcome to joLink! Type your message or /help for commands.",
+            "goodbye": "Goodbye from joLink!",
+            "response_label": " joLink ",
             "prompt_symbol": "❯",
             "help_header": "[?] Available Commands",
         },
@@ -337,10 +348,11 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
         },
         "spinner": {},
         "branding": {
-            "agent_name": "Hermes Agent",
-            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
-            "goodbye": "Goodbye! ⚕",
-            "response_label": " ⚕ Hermes ",
+            "agent_name": "joLink",
+            "tagline": "Runtime evidence for coding agents",
+            "welcome": "Welcome to joLink! Type your message or /help for commands.",
+            "goodbye": "Goodbye from joLink!",
+            "response_label": " joLink ",
             "prompt_symbol": "❯",
             "help_header": "(^_^)? Available Commands",
         },
@@ -374,10 +386,11 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
         },
         "spinner": {},
         "branding": {
-            "agent_name": "Hermes Agent",
-            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
-            "goodbye": "Goodbye! ⚕",
-            "response_label": " ⚕ Hermes ",
+            "agent_name": "joLink",
+            "tagline": "Runtime evidence for coding agents",
+            "welcome": "Welcome to joLink! Type your message or /help for commands.",
+            "goodbye": "Goodbye from joLink!",
+            "response_label": " joLink ",
             "prompt_symbol": "❯",
             "help_header": "[?] Available Commands",
         },
@@ -411,10 +424,11 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
         },
         "spinner": {},
         "branding": {
-            "agent_name": "Hermes Agent",
-            "welcome": "Welcome to Hermes Agent! Type your message or /help for commands.",
-            "goodbye": "Goodbye! \u2695",
-            "response_label": " \u2695 Hermes ",
+            "agent_name": "joLink",
+            "tagline": "Runtime evidence for coding agents",
+            "welcome": "Welcome to joLink! Type your message or /help for commands.",
+            "goodbye": "Goodbye from joLink!",
+            "response_label": " joLink ",
             "prompt_symbol": "\u276f",
             "help_header": "(^_^)? Available Commands",
         },
@@ -834,7 +848,7 @@ def get_active_help_header(fallback: str = "(^_^)? Available Commands") -> str:
 
 
 
-def get_active_goodbye(fallback: str = "Goodbye! ⚕") -> str:
+def get_active_goodbye(fallback: str = "Goodbye from joLink!") -> str:
     """Get the goodbye line from the active skin."""
     try:
         return get_active_skin().get_branding("goodbye", fallback)
