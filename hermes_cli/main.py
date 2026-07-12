@@ -6175,7 +6175,7 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
 
 
 def _update_via_zip(args):
-    """Update Hermes Agent by downloading a ZIP archive.
+    """Update joLink by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
@@ -6204,7 +6204,7 @@ def _update_via_zip(args):
         )
         sys.exit(1)
     zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
+        f"https://github.com/L1ch404/hermes-agent/archive/refs/heads/{branch}.zip"
     )
 
     print("→ Downloading latest version...")
@@ -6612,6 +6612,10 @@ def _discard_stashed_changes(
 # =========================================================================
 
 OFFICIAL_REPO_URLS = {
+    "https://github.com/L1ch404/hermes-agent.git",
+    "git@github.com:L1ch404/hermes-agent.git",
+    "https://github.com/L1ch404/hermes-agent",
+    "git@github.com:L1ch404/hermes-agent",
     "https://github.com/NousResearch/hermes-agent.git",
     "git@github.com:NousResearch/hermes-agent.git",
     "https://github.com/NousResearch/hermes-agent",
@@ -8898,7 +8902,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
 
 
 def cmd_update(args):
-    """Update Hermes Agent to the latest version.
+    """Update joLink to the latest version.
 
     Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
     runs the update, then restores stdio on the way out (even on
@@ -8912,7 +8916,7 @@ def cmd_update(args):
     )
 
     if is_managed():
-        managed_error("update Hermes Agent")
+        managed_error("update joLink")
         return
 
     # Docker users can't ``git pull`` — the image excludes ``.git`` from
@@ -9043,7 +9047,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Could not read updates.non_interactive_local_changes: %s", exc)
             discard_local_changes = False
 
-    print("⚕ Updating Hermes Agent...")
+    print("→ Updating joLink...")
     print()
 
     # On Windows, abort early if another hermes.exe is holding the venv shim
@@ -9087,7 +9091,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 return
             print("✗ Not a git repository. Please reinstall:")
             print(
-                "  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+                "  curl -fsSL https://raw.githubusercontent.com/"
+                "L1ch404/hermes-agent/main/scripts/install.sh | bash"
             )
             sys.exit(1)
 

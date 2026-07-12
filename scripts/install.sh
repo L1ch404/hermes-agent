@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# Hermes Agent Installer
+# joLink Installer
 # ============================================================================
 # Installation script for Linux, macOS, and Android/Termux.
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -43,8 +43,8 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPO_URL_SSH="git@github.com:L1ch404/hermes-agent.git"
+REPO_URL_HTTPS="https://github.com/L1ch404/hermes-agent.git"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -155,7 +155,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Hermes Agent Installer"
+            echo "joLink Installer"
             echo ""
             echo "Usage: install.sh [OPTIONS]"
             echo ""
@@ -210,9 +210,9 @@ print_banner() {
     echo ""
     echo -e "${MAGENTA}${BOLD}"
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│             ⚕ Hermes Agent Installer                    │"
+    echo "│                    joLink Installer                     │"
     echo "├─────────────────────────────────────────────────────────┤"
-    echo "│  An open source AI agent by Nous Research.              │"
+    echo "│          Runtime evidence for coding agents             │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo -e "${NC}"
 }
@@ -522,7 +522,7 @@ detect_os() {
             OS="windows"
             DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  iex (irm https://hermes-agent.nousresearch.com/install.ps1)"
+            log_info "  iex (irm https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.ps1)"
             exit 1
             ;;
         *)
@@ -1187,6 +1187,19 @@ clone_repo() {
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
 
+            local current_origin
+            local pre_jolink_branch
+            local switched_to_jolink_origin=false
+            current_origin="$(git remote get-url origin 2>/dev/null || true)"
+            if [ "$current_origin" != "$REPO_URL_HTTPS" ] && [ "$current_origin" != "$REPO_URL_SSH" ]; then
+                log_warn "Switching existing installation to the joLink release repository."
+                pre_jolink_branch="pre-jolink-$(date -u +%Y%m%d-%H%M%S)"
+                git branch "$pre_jolink_branch" HEAD
+                log_info "Preserved previous source revision as branch $pre_jolink_branch"
+                git remote set-url origin "$REPO_URL_HTTPS"
+                switched_to_jolink_origin=true
+            fi
+
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
             if [ -n "$(git status --porcelain)" ]; then
@@ -1216,8 +1229,12 @@ clone_repo() {
             # into a multi-minute download that can stall the installer.
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
             git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
-            git pull --ff-only origin "$BRANCH"
+            if [ "$switched_to_jolink_origin" = true ]; then
+                git checkout -B "$BRANCH" "origin/$BRANCH"
+            else
+                git checkout "$BRANCH"
+                git pull --ff-only origin "$BRANCH"
+            fi
 
             if [ -n "$autostash_ref" ]; then
                 local restore_now="yes"

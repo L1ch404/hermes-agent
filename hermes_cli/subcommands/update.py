@@ -16,8 +16,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     # =========================================================================
     update_parser = subparsers.add_parser(
         "update",
-        help="Update Hermes Agent to the latest version",
-        description="Pull the latest changes from git and reinstall dependencies",
+        help="Update joLink to the latest version",
+        description="Pull the latest joLink changes from git and reinstall dependencies",
     )
     update_parser.add_argument(
         "--gateway",
