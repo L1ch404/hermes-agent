@@ -1,4 +1,5 @@
 """Tests for setup.py configuration flows."""
+import os
 import sys
 import types
 
@@ -350,6 +351,38 @@ def test_select_provider_and_model_warns_if_named_custom_provider_disappears(
     assert "selected saved custom provider is no longer available" in out
 
 
+def test_provider_picker_auto_detection_disables_network_aws_metadata_only_temporarily(
+    tmp_path, monkeypatch
+):
+    """Opening the provider menu must not wait on EC2 metadata discovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    observed_imds_settings = []
+
+    def fake_resolve_provider(provider):
+        assert provider == "auto"
+        observed_imds_settings.append(os.environ.get("AWS_EC2_METADATA_DISABLED"))
+        return None
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_provider", fake_resolve_provider)
+    monkeypatch.setattr(
+        "hermes_cli.main._prompt_provider_choice",
+        lambda choices, default=0: len(choices) - 1,
+    )
+
+    from hermes_cli.main import select_provider_and_model
+
+    monkeypatch.delenv("AWS_EC2_METADATA_DISABLED", raising=False)
+    select_provider_and_model()
+    assert "AWS_EC2_METADATA_DISABLED" not in os.environ
+
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "false")
+    select_provider_and_model()
+    assert os.environ["AWS_EC2_METADATA_DISABLED"] == "false"
+    assert observed_imds_settings == ["true", "true"]
+
+
 def test_select_provider_and_model_accepts_named_provider_from_providers_section(
     tmp_path, monkeypatch, capsys
 ):
@@ -539,4 +572,3 @@ def test_prompt_yes_no_keyboard_interrupt_still_exits(monkeypatch):
 
     with pytest.raises(SystemExit):
         setup_mod.prompt_yes_no("Install it now?", True)
-

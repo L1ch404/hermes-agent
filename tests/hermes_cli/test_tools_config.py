@@ -1301,6 +1301,12 @@ def test_discord_toolsets_in_default_off():
     assert "discord_admin" in _DEFAULT_OFF_TOOLSETS
 
 
+def test_computer_use_is_opt_in_on_first_install():
+    """Fresh setup must not download cua-driver unless the user opts in."""
+    assert "computer_use" in _DEFAULT_OFF_TOOLSETS
+    assert "computer_use" not in _get_platform_tools({}, "cli")
+
+
 def test_discord_toolsets_not_available_on_other_platforms():
     """Platform-scoping: discord / discord_admin should not appear on CLI,
     Telegram, etc. — not even as an opt-in."""

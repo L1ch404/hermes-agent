@@ -2939,6 +2939,15 @@ def select_provider_and_model(args=None):
             )
             print(f"Warning: {warning} Falling back to auto provider detection.")
     if not active:
+        # Provider auto-detection includes the full AWS credential chain.  In
+        # botocore that may probe the EC2 metadata service, which can block for
+        # several seconds (or much longer behind a proxy) before the provider
+        # picker is even rendered.  The picker only needs a best-effort default
+        # row, so keep local AWS env/profile/shared-file detection but suppress
+        # network metadata probing for this one preselection step.  Selecting
+        # Bedrock still uses the normal credential chain at setup/runtime.
+        _previous_imds_setting = os.environ.get("AWS_EC2_METADATA_DISABLED")
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
         try:
             active = resolve_provider("auto")
         except AuthError as exc:
@@ -2946,6 +2955,11 @@ def select_provider_and_model(args=None):
                 warning = format_auth_error(exc)
                 print(f"Warning: {warning} Falling back to auto provider detection.")
             active = None  # no provider yet; default to first in list
+        finally:
+            if _previous_imds_setting is None:
+                os.environ.pop("AWS_EC2_METADATA_DISABLED", None)
+            else:
+                os.environ["AWS_EC2_METADATA_DISABLED"] = _previous_imds_setting
 
     # Detect custom endpoint
     if active == "openrouter" and get_env_value("OPENAI_BASE_URL"):
