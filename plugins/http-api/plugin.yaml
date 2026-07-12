@@ -1,6 +1,6 @@
 name: http-api
 version: 1.0.0
-description: "Call HTTP APIs — send GET/POST/PUT/DELETE requests with custom headers and body."
+description: "Archived HTTP API helper; tool registration is disabled in joLink."
 requires_env: []
 author: chenLi
 kind: backend

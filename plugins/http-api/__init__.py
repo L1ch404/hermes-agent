@@ -170,13 +170,19 @@ def _handle_call_http_api(args: dict[str, Any], **kw: Any) -> str:
 
 
 def register(ctx) -> None:
-    """Register the ``call_http_api`` tool via the plugin context."""
-    ctx.register_tool(
-        name="call_http_api",
-        toolset="runtime",
-        schema=CALL_HTTP_API_SCHEMA,
-        handler=_handle_call_http_api,
-        emoji="🌐",
-        description="Send HTTP requests to any URL with custom method, headers, and body.",
+    """Keep the archived implementation installed without exposing a tool.
+
+    ``call_http_api`` used to share the ``runtime`` toolset with
+    ``java_runtime``. In dogfood, models repeatedly selected it as though it
+    were the Java observation/control tool. Terminal ``curl`` already covers
+    the legitimate request-triggering use case, so exposing another always-on
+    model schema adds ambiguity without adding capability.
+
+    Keep this module and handler for possible future extraction into a
+    separately named, explicitly enabled toolset; registration is intentionally
+    disabled in the current joLink distribution.
+    """
+    logger.info(
+        "http-api plugin: call_http_api registration disabled to avoid "
+        "java_runtime tool-selection ambiguity"
     )
-    logger.info("http-api plugin: registered call_http_api tool")
