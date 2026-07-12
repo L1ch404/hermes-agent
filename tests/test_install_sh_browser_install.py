@@ -18,8 +18,8 @@ def test_install_script_does_not_autodetect_system_browser_on_path() -> None:
     Auto-detection silently bound the install to whatever ``command -v
     chromium`` resolved to — most damagingly a Snap Chromium, whose sandbox
     blocks agent-browser's control socket and hangs every browser_navigate. The
-    fallback was dropped in favor of always using the bundled Playwright
-    Chromium, so the old PATH-scan and "use the system browser" path are gone.
+    fallback was dropped in favor of an explicit Playwright Chromium install,
+    so the old PATH-scan and "use the system browser" path are gone.
     """
     text = INSTALL_SH.read_text()
 
@@ -76,13 +76,16 @@ def test_playwright_installs_are_timeout_guarded() -> None:
 
 
 def test_install_script_supports_skip_browser_flag() -> None:
-    """--skip-browser (and --no-playwright alias) skips the Playwright install."""
+    """Chromium is opt-in; compatibility skip flags remain supported."""
     text = INSTALL_SH.read_text()
 
     assert "--skip-browser|--no-playwright)" in text
     assert "SKIP_BROWSER=true" in text
+    assert "--with-browser)" in text
+    assert "SKIP_BROWSER=false" in text
     assert 'if [ "$SKIP_BROWSER" = true ]; then' in text
-    assert "--skip-browser Skip Playwright/Chromium install" in text
+    assert "--with-browser Install Playwright Chromium" in text
+    assert "--skip-browser Skip Playwright/Chromium install (default)" in text
 
 
 def test_install_script_skips_with_deps_when_no_sudo() -> None:
@@ -289,4 +292,3 @@ def test_override_retry_skipped_on_unsupported_arch() -> None:
     r = _run_install_fn("ubuntu", "26.04", native_fails=True, arch="riscv64")
     assert len(r["runs"]) == 1, r["runs"]
     assert r["final_rc"] == 1
-

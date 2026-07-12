@@ -69,7 +69,7 @@ DETECTED_BROWSER_EXECUTABLE=""
 # Options
 USE_VENV=true
 RUN_SETUP=true
-SKIP_BROWSER=false
+SKIP_BROWSER=true
 NO_SKILLS=false
 BRANCH="main"
 INSTALL_COMMIT=""
@@ -103,6 +103,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-browser|--no-playwright)
             SKIP_BROWSER=true
+            shift
+            ;;
+        --with-browser)
+            SKIP_BROWSER=false
             shift
             ;;
         --no-skills)
@@ -162,7 +166,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --no-venv      Don't create virtual environment"
             echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --skip-browser Skip Playwright/Chromium install (browser tools won't work)"
+            echo "  --with-browser Install Playwright Chromium for local browser tools"
+            echo "  --skip-browser Skip Playwright/Chromium install (default)"
             echo "  --no-skills    Start with a blank slate — seed no bundled skills, and"
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
@@ -978,6 +983,8 @@ check_network_prerequisites() {
 }
 
 install_system_packages() {
+    local include_ffmpeg="${1:-false}"
+
     # Detect what's missing
     HAS_RIPGREP=false
     HAS_FFMPEG=false
@@ -992,13 +999,17 @@ install_system_packages() {
         need_ripgrep=true
     fi
 
-    log_info "Checking ffmpeg (TTS voice messages)..."
-    if command -v ffmpeg &> /dev/null; then
-        local ffmpeg_ver=$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')
-        log_success "ffmpeg $ffmpeg_ver found"
-        HAS_FFMPEG=true
-    else
-        need_ffmpeg=true
+    # Keep the large optional media dependency off the default install path.
+    # It remains available through the explicit `--ensure ffmpeg` flow.
+    if [ "$include_ffmpeg" = true ]; then
+        log_info "Checking ffmpeg (TTS voice messages)..."
+        if command -v ffmpeg &> /dev/null; then
+            local ffmpeg_ver=$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')
+            log_success "ffmpeg $ffmpeg_ver found"
+            HAS_FFMPEG=true
+        else
+            need_ffmpeg=true
+        fi
     fi
 
     # Termux always needs the Android build toolchain for the tested pip path,
@@ -2156,7 +2167,7 @@ install_node_deps() {
         # For Arch/Manjaro we install the system libs via pacman first.
         # Other systems must install Chromium dependencies manually.
         if [ "$SKIP_BROWSER" = true ]; then
-            log_info "Skipping Playwright/Chromium install (--skip-browser)"
+            log_info "Skipping Playwright/Chromium install (optional; use --with-browser to install)"
             log_info "Browser tools will be unavailable until you run manually:"
             log_info "  cd $INSTALL_DIR && npx playwright install chromium"
             log_info "On apt-based systems, an admin also needs to run:"
@@ -2567,7 +2578,7 @@ ensure_mode() {
                 if ! command -v ffmpeg &>/dev/null; then
                     HAS_FFMPEG=false
                     HAS_RIPGREP=true
-                    install_system_packages
+                    install_system_packages true
                 fi
                 ;;
             *)

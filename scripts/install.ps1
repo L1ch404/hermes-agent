@@ -15,6 +15,7 @@
 param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
+    [switch]$IncludeBrowser,
     [string]$Branch = "main",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
@@ -1082,6 +1083,8 @@ function Update-ProcessPathForPackages {
 }
 
 function Install-SystemPackages {
+    param([switch]$IncludeFfmpeg)
+
     $script:HasRipgrep = $false
     $script:HasFfmpeg = $false
     $needRipgrep = $false
@@ -1096,12 +1099,17 @@ function Install-SystemPackages {
         $needRipgrep = $true
     }
 
-    Write-Info "Checking ffmpeg (TTS voice messages)..."
-    if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-        Write-Success "ffmpeg found"
-        $script:HasFfmpeg = $true
-    } else {
-        $needFfmpeg = $true
+    # ffmpeg is a large optional media dependency whose WinGet package is
+    # downloaded from GitHub Releases. Do not put it on the default install
+    # path; only probe/install it when explicitly requested via -Ensure ffmpeg.
+    if ($IncludeFfmpeg) {
+        Write-Info "Checking ffmpeg (TTS voice messages)..."
+        if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            Write-Success "ffmpeg found"
+            $script:HasFfmpeg = $true
+        } else {
+            $needFfmpeg = $true
+        }
     }
 
     if (-not $needRipgrep -and -not $needFfmpeg) { return }
@@ -2358,13 +2366,10 @@ function Install-NodeDeps {
         $browserLog = "$env:TEMP\hermes-npm-browser-$(Get-Random).log"
         $browserNpmOk = _Run-NpmInstall "Browser tools" $InstallDir $browserLog $npmExe
 
-        # Install Playwright Chromium (mirrors scripts/install.sh behaviour for
-        # Linux).  Without this, tools/browser_tool.py::check_browser_requirements
-        # returns False (no Chromium under %LOCALAPPDATA%\ms-playwright), and the
-        # browser_* tools are silently filtered out of the agent's tool schema.
-        # System Chrome at "C:\Program Files\Google\Chrome\..." is NOT used by
-        # agent-browser -- it expects a Playwright-managed Chromium.
-        if ($browserNpmOk) {
+        # Playwright Chromium is a large optional download and is not needed by
+        # Java Runtime dogfood. Keep it off the default install path; callers
+        # that explicitly pass -IncludeBrowser retain the full browser setup.
+        if ($browserNpmOk -and $IncludeBrowser) {
             Write-Info "Installing browser engine (Playwright Chromium)..."
             # npx lives next to npm in the same bin dir.  Prefer .cmd to dodge
             # the same execution-policy gotcha that affects npm.ps1 (see above).
@@ -2452,6 +2457,8 @@ function Install-NodeDeps {
                     Pop-Location
                 }
             }
+        } elseif ($browserNpmOk) {
+            Write-Info "Skipping Playwright Chromium (optional; pass -IncludeBrowser to install)"
         }
     }
 
@@ -3236,7 +3243,7 @@ $InstallStages = @(
     @{ Name = "python";           Title = "Verifying Python $PythonVersion";      Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Python" }
     @{ Name = "git";              Title = "Installing Git";                       Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Git" }
     @{ Name = "node";             Title = "Detecting Node.js";                    Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Node" }
-    @{ Name = "system-packages";  Title = "Installing ripgrep and ffmpeg";        Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-SystemPackages" }
+    @{ Name = "system-packages";  Title = "Installing ripgrep";                   Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-SystemPackages" }
     @{ Name = "repository";       Title = "Cloning Hermes repository";            Category = "install";      NeedsUserInput = $false; Worker = "Stage-Repository" }
     @{ Name = "venv";             Title = "Creating Python virtual environment";  Category = "install";      NeedsUserInput = $false; Worker = "Stage-Venv" }
     @{ Name = "dependencies";     Title = "Installing Python dependencies";       Category = "install";      NeedsUserInput = $false; Worker = "Stage-Dependencies" }
@@ -3418,7 +3425,7 @@ function Invoke-EnsureMode {
                 Write-Info "ripgrep: install manually on Windows (scoop install ripgrep)"
             }
             "ffmpeg" {
-                Write-Info "ffmpeg: install manually on Windows (scoop install ffmpeg)"
+                Install-SystemPackages -IncludeFfmpeg
             }
             default {
                 Write-Err "Unknown dependency: $dep"

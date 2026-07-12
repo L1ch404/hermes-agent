@@ -62,3 +62,26 @@ def test_dogfood_guide_includes_first_time_quick_start() -> None:
     assert "hermes tools --summary" in DOGFOOD_GUIDE
     assert "`/new`" in DOGFOOD_GUIDE
     assert "`java_runtime`" in DOGFOOD_GUIDE
+
+
+def test_default_install_does_not_request_ffmpeg() -> None:
+    assert "function Install-SystemPackages {\n    param([switch]$IncludeFfmpeg)" in INSTALL_PS1
+    assert "function Stage-SystemPackages   { Install-SystemPackages }" in INSTALL_PS1
+    assert "Install-SystemPackages -IncludeFfmpeg" in INSTALL_PS1
+    assert 'Title = "Installing ripgrep"' in INSTALL_PS1
+
+    assert 'local include_ffmpeg="${1:-false}"' in INSTALL_SH
+    assert "install_system_packages true" in INSTALL_SH
+    assert "    install_system_packages\n" in INSTALL_SH
+
+
+def test_default_install_does_not_download_chromium() -> None:
+    assert "[switch]$IncludeBrowser" in INSTALL_PS1
+    assert "if ($browserNpmOk -and $IncludeBrowser)" in INSTALL_PS1
+    assert "function Stage-NodeDeps         { Install-NodeDeps }" in INSTALL_PS1
+    assert "pass -IncludeBrowser to install" in INSTALL_PS1
+
+    assert "SKIP_BROWSER=true" in INSTALL_SH
+    assert "--with-browser)" in INSTALL_SH
+    assert "SKIP_BROWSER=false" in INSTALL_SH
+    assert "use --with-browser to install" in INSTALL_SH
