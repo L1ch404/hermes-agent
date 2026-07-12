@@ -47,6 +47,7 @@ REPO_URL_SSH="git@github.com:L1ch404/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/L1ch404/hermes-agent.git"
 REPO_ARCHIVE_MIRROR="https://7355608.net/jolink/main.zip"
 REPO_ARCHIVE_MIRROR_SHA256="https://7355608.net/jolink/main.zip.sha256"
+NPM_REGISTRY="https://registry.npmmirror.com"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -1414,22 +1415,24 @@ clone_repo() {
     else
         local repository_ready=false
 
-        log_info "Trying HTTPS clone..."
-        if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
-            log_success "Cloned via HTTPS"
-            repository_ready=true
-        else
-            rm -rf "$INSTALL_DIR" 2>/dev/null
-        fi
-
         # Archive bootstrap is used only when no exact commit was requested.
         # A source ZIP can reproduce a tree but cannot reproduce the original
         # Git commit object/HEAD, so using it for --commit would violate the
-        # pinning contract.
-        if [ "$repository_ready" = false ] && [ -z "$INSTALL_COMMIT" ] \
-           && [ "$BRANCH" = "main" ]; then
+        # pinning contract. The joLink mirror is intentionally the default for
+        # main so domestic installs do not wait for GitHub to time out first.
+        if [ -z "$INSTALL_COMMIT" ] && [ "$BRANCH" = "main" ]; then
             if install_repo_archive "$REPO_ARCHIVE_MIRROR" \
                 "$REPO_ARCHIVE_MIRROR_SHA256" "joLink China mirror"; then
+                repository_ready=true
+            else
+                rm -rf "$INSTALL_DIR" 2>/dev/null
+            fi
+        fi
+
+        if [ "$repository_ready" = false ]; then
+            log_info "Trying HTTPS clone..."
+            if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+                log_success "Cloned via HTTPS"
                 repository_ready=true
             else
                 rm -rf "$INSTALL_DIR" 2>/dev/null
@@ -2300,27 +2303,33 @@ install_node_deps() {
         return 0
     fi
 
-    if [ -f "$INSTALL_DIR/package.json" ]; then
+    npm_install_args=(
+        --registry="$NPM_REGISTRY"
+        --replace-registry-host=always
+        --no-audit
+        --no-fund
+        --progress=false
+        --fetch-retries=2
+        --fetch-timeout=60000
+        --loglevel=notice
+    )
+
+    if [ -f "$INSTALL_DIR/package.json" ] && [ "$SKIP_BROWSER" = false ]; then
         log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"
-        # Time-boxed: a stalled registry fetch would otherwise hang here with no
-        # progress (same #39219 stall class as the desktop build below).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        # Root-only avoids recursively installing desktop/web/TUI workspaces.
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --workspaces=false \
+            "${npm_install_args[@]}"; then
+            log_success "Browser-tool Node dependencies installed"
+        else
             log_warn "npm install failed or timed out (browser tools may not work)"
-        }
-        log_success "Node.js dependencies installed"
+            return 0
+        fi
 
         # Install Playwright browser + system dependencies.
         # Playwright's --with-deps only supports apt-based systems natively.
         # For Arch/Manjaro we install the system libs via pacman first.
         # Other systems must install Chromium dependencies manually.
-        if [ "$SKIP_BROWSER" = true ]; then
-            log_info "Skipping Playwright/Chromium install (optional; use --with-browser to install)"
-            log_info "Browser tools will be unavailable until you run manually:"
-            log_info "  cd $INSTALL_DIR && npx playwright install chromium"
-            log_info "On apt-based systems, an admin also needs to run:"
-            log_info "  sudo npx playwright install-deps chromium"
-        else
         log_info "Installing browser engine (Playwright Chromium)..."
         strip_snap_browser_override
         DETECTED_BROWSER_EXECUTABLE="$(find_system_browser 2>/dev/null || true)"
@@ -2398,19 +2407,23 @@ install_node_deps() {
                     ;;
             esac
         fi
-        fi
         log_success "Browser engine setup complete"
+    elif [ -f "$INSTALL_DIR/package.json" ]; then
+        log_info "Skipping browser-tool Node dependencies (optional; use --with-browser to install)"
     fi
 
-    # Install TUI dependencies
+    # Install only the ui-tui workspace. A plain npm install from ui-tui can
+    # still resolve sibling workspaces through the root lockfile.
     if [ -f "$INSTALL_DIR/ui-tui/package.json" ]; then
         log_info "Installing TUI dependencies..."
-        cd "$INSTALL_DIR/ui-tui"
-        # Time-boxed: a stalled registry fetch would otherwise hang here (#39219).
-        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent || {
+        cd "$INSTALL_DIR"
+        if run_with_timeout "$NODE_DEPS_TIMEOUT" npm install \
+            --workspace ui-tui --include-workspace-root=false \
+            "${npm_install_args[@]}"; then
+            log_success "TUI dependencies installed"
+        else
             log_warn "TUI npm install failed or timed out (hermes --tui may not work)"
-        }
-        log_success "TUI dependencies installed"
+        fi
     fi
 
     # Keep the checkout clean so `hermes update` doesn't autostash every run.

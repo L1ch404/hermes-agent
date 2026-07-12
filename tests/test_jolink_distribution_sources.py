@@ -48,7 +48,7 @@ def test_windows_zip_fallback_uses_jolink_archives() -> None:
     assert f'{archive_base}/$Commit' in INSTALL_PS1
     assert f'{archive_base}/refs/tags/$Tag' in INSTALL_PS1
     assert f'{archive_base}/refs/heads/$Branch' in INSTALL_PS1
-    assert "-TimeoutSec 180" in INSTALL_PS1
+    assert "-TimeoutSec 600 -ShowProgress" in INSTALL_PS1
     assert (
         f'{archive_base}/refs/heads/{{branch}}' in
         Path(hermes_main.__file__).read_text(encoding="utf-8")
@@ -63,18 +63,22 @@ def test_windows_zip_fallback_uses_jolink_archives() -> None:
     assert "SHA-256 verified" in main_source
 
 
-def test_windows_repository_fallback_order_avoids_unnecessary_ssh_errors() -> None:
-    https_pos = INSTALL_PS1.index('Write-Info "Trying HTTPS clone..."')
+def test_windows_repository_prefers_mirror_and_avoids_unnecessary_ssh_errors() -> None:
+    assert '$preferMirror = (-not $Commit -and -not $Tag -and $Branch -eq "main")' in INSTALL_PS1
+    assert 'Write-Info "Using joLink China mirror as the primary repository source..."' in INSTALL_PS1
     mirror_pos = INSTALL_PS1.index('Write-Info "Trying joLink China mirror..."')
     codeload_pos = INSTALL_PS1.index('Write-Info "Trying GitHub codeload..."')
     ssh_pos = INSTALL_PS1.index("trying SSH clone as the final fallback")
-    assert https_pos < mirror_pos < codeload_pos < ssh_pos
+    assert mirror_pos < codeload_pos < ssh_pos
+    assert "function Invoke-DownloadFile" in INSTALL_PS1
+    assert "--progress-bar" in INSTALL_PS1
+    assert "PowerShell 5.1" in INSTALL_PS1
 
 
 def test_windows_zip_fallback_creates_a_valid_git_head() -> None:
     assert "git add -A" in INSTALL_PS1
     assert '"user.name=joLink Installer"' in INSTALL_PS1
-    assert '-m "Bootstrap joLink from codeload archive"' in INSTALL_PS1
+    assert '-m "Bootstrap joLink from source archive"' in INSTALL_PS1
     assert "$usedZipFallback = $true" in INSTALL_PS1
     assert "-not $usedZipFallback" in INSTALL_PS1
 
@@ -87,6 +91,9 @@ def test_posix_archive_fallback_uses_mirror_and_valid_git_head() -> None:
     assert "https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/$BRANCH" in INSTALL_SH
     assert 'commit --no-verify -m "Bootstrap joLink from source archive"' in INSTALL_SH
     assert 'if [ "$repository_ready" = false ] && [ -z "$INSTALL_COMMIT" ]' in INSTALL_SH
+    mirror_pos = INSTALL_SH.index('"joLink China mirror"')
+    https_pos = INSTALL_SH.index('log_info "Trying HTTPS clone..."')
+    assert mirror_pos < https_pos
 
 
 def test_runtime_update_sources_are_jolink() -> None:
@@ -128,3 +135,18 @@ def test_default_install_does_not_download_chromium() -> None:
     assert "--with-browser)" in INSTALL_SH
     assert "SKIP_BROWSER=false" in INSTALL_SH
     assert "use --with-browser to install" in INSTALL_SH
+
+
+def test_default_install_scopes_node_dependencies_and_uses_china_registry() -> None:
+    npm_registry = "https://registry.npmmirror.com"
+    assert f'$NpmRegistry = "{npm_registry}"' in INSTALL_PS1
+    assert 'if ($IncludeBrowser -and (Test-Path "$InstallDir\\package.json"))' in INSTALL_PS1
+    assert '@("install", "--workspaces=false")' in INSTALL_PS1
+    assert '@("install", "--workspace", "ui-tui", "--include-workspace-root=false")' in INSTALL_PS1
+    assert "Skipping browser-tool Node dependencies" in INSTALL_PS1
+
+    assert f'NPM_REGISTRY="{npm_registry}"' in INSTALL_SH
+    assert '[ "$SKIP_BROWSER" = false ]' in INSTALL_SH
+    assert "npm install --workspaces=false" in INSTALL_SH
+    assert "--workspace ui-tui --include-workspace-root=false" in INSTALL_SH
+    assert "Skipping browser-tool Node dependencies" in INSTALL_SH

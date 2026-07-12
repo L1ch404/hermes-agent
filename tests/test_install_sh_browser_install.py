@@ -83,7 +83,8 @@ def test_install_script_supports_skip_browser_flag() -> None:
     assert "SKIP_BROWSER=true" in text
     assert "--with-browser)" in text
     assert "SKIP_BROWSER=false" in text
-    assert 'if [ "$SKIP_BROWSER" = true ]; then' in text
+    assert '[ "$SKIP_BROWSER" = false ]' in text
+    assert "Skipping browser-tool Node dependencies" in text
     assert "--with-browser Install Playwright Chromium" in text
     assert "--skip-browser Skip Playwright/Chromium install (default)" in text
 

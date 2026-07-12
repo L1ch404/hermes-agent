@@ -141,6 +141,7 @@ $RepoUrlSsh = "git@github.com:L1ch404/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/L1ch404/hermes-agent.git"
 $RepoArchiveMirror = "https://7355608.net/jolink/main.zip"
 $RepoArchiveMirrorSha256 = "https://7355608.net/jolink/main.zip.sha256"
+$NpmRegistry = "https://registry.npmmirror.com"
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -248,6 +249,37 @@ function Invoke-NativeWithRelaxedErrorAction {
         $ErrorActionPreference = $prevEAP
     }
 }
+
+function Invoke-DownloadFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [int]$TimeoutSec = 600,
+        [switch]$ShowProgress
+    )
+
+    # Windows PowerShell 5.1's Invoke-WebRequest progress UI repaints on every
+    # received chunk and can slow large downloads by 10-100x. Modern Windows
+    # ships curl.exe, whose progress bar is lightweight and streams directly to
+    # the console. Keep IWR as the compatibility fallback for older systems.
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($ShowProgress -and $curl) {
+        Invoke-NativeWithRelaxedErrorAction {
+            & $curl.Source --fail --location --connect-timeout 10 `
+                --max-time $TimeoutSec --progress-bar --output $OutFile $Uri
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed (exit $LASTEXITCODE): $Uri"
+        }
+        return
+    }
+
+    if ($ShowProgress) {
+        Write-Info "curl.exe not available; downloading without a progress bar..."
+    }
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec
+}
+
 function Discard-LockfileChurn {
     param([string]$Repo = $InstallDir)
 
@@ -1488,15 +1520,17 @@ function Install-Repository {
         $env:GIT_CONFIG_VALUE_0 = "false"
         git config --global windows.appendAtomically false 2>$null
 
-        # This is a public repository, so HTTPS is the least surprising first
-        # choice.  SSH is kept as the final fallback for users who have GitHub
-        # keys configured, but it should not produce a host-key warning before
-        # the credential-free paths have been tried.
-        Write-Info "Trying HTTPS clone..."
-        try {
-            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
-            if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
-        } catch { }
+        $preferMirror = (-not $Commit -and -not $Tag -and $Branch -eq "main")
+        if ($preferMirror) {
+            Write-Info "Using joLink China mirror as the primary repository source..."
+        } else {
+            # Exact pins and non-main branches are not present on the mirror.
+            Write-Info "Trying HTTPS clone..."
+            try {
+                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
+                if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
+            } catch { }
+        }
 
         # ZIP fallbacks bypass git file I/O entirely. For the default main
         # channel, prefer the joLink-operated mainland mirror and verify its
@@ -1505,7 +1539,7 @@ function Install-Repository {
         # GitHub codeload remains the credential-free fallback for every ref.
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "HTTPS clone failed -- downloading ZIP fallback instead..."
+            Write-Info "Downloading repository archive..."
             try {
                 # Pick the ZIP URL for the most-specific ref the caller asked
                 # for. codeload supports commits, tags, and branches; honour
@@ -1529,8 +1563,8 @@ function Install-Repository {
                 if (-not $Commit -and -not $Tag -and $Branch -eq "main") {
                     Write-Info "Trying joLink China mirror..."
                     try {
-                        Invoke-WebRequest -Uri $RepoArchiveMirror -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
-                        Invoke-WebRequest -Uri $RepoArchiveMirrorSha256 -OutFile $zipHashPath -UseBasicParsing -TimeoutSec 30
+                        Invoke-DownloadFile -Uri $RepoArchiveMirror -OutFile $zipPath -TimeoutSec 600 -ShowProgress
+                        Invoke-DownloadFile -Uri $RepoArchiveMirrorSha256 -OutFile $zipHashPath -TimeoutSec 30
                         $expectedHash = ((Get-Content $zipHashPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
                         if ($expectedHash -notmatch '^[0-9a-f]{64}$') {
                             throw "mirror SHA-256 file is malformed"
@@ -1550,7 +1584,7 @@ function Install-Repository {
 
                 if (-not $downloadedZip) {
                     Write-Info "Trying GitHub codeload..."
-                    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
+                    Invoke-DownloadFile -Uri $zipUrl -OutFile $zipPath -TimeoutSec 600 -ShowProgress
                 }
                 if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
                 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
@@ -1576,7 +1610,7 @@ function Install-Repository {
                         git remote add origin $RepoUrlHttps
                         git add -A
                         if ($LASTEXITCODE -ne 0) { throw "git add failed (exit $LASTEXITCODE)" }
-                        git -c "user.name=joLink Installer" -c "user.email=installer@jolink.local" -c "commit.gpgsign=false" commit --no-verify -m "Bootstrap joLink from codeload archive"
+                        git -c "user.name=joLink Installer" -c "user.email=installer@jolink.local" -c "commit.gpgsign=false" commit --no-verify -m "Bootstrap joLink from source archive"
                         if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
                         if (-not $Commit -and -not $Tag) {
                             git branch -M $Branch
@@ -1606,7 +1640,7 @@ function Install-Repository {
         # key configured for the repository.
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "Codeload failed, trying SSH clone as the final fallback..."
+            Write-Warn "Repository archive sources failed, trying SSH clone as the final fallback..."
             $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
             try {
                 Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
@@ -1616,7 +1650,7 @@ function Install-Repository {
         }
 
         if (-not $cloneSuccess) {
-            throw "Failed to download repository (tried HTTPS clone, direct codeload ZIP, and SSH clone)"
+            throw "Failed to download repository (tried joLink/GitHub sources and SSH)"
         }
     }
 
@@ -2359,11 +2393,12 @@ function Install-NodeDeps {
     # PE file.  The invocation-operator ``& $npmExe`` routes through the
     # PowerShell command pipeline which DOES honour .cmd batch shims, so
     # it works uniformly for npm.cmd, npx.cmd, and bare .exe files.
-    function _Run-NpmInstall([string]$label, [string]$installDir, [string]$logPath, [string]$npmPath) {
+    function _Run-NpmInstall([string]$label, [string]$installDir, [string]$logPath, [string]$npmPath, [string[]]$installArgs) {
         Push-Location $installDir
         # Capture EAP outside the try block so the catch's restore call always
         # has a meaningful value (see Install-Uv for the full rationale).
         $prevEAP = $ErrorActionPreference
+        $prevCI = $env:CI
         try {
             # Stream npm's output to BOTH the console and the log file via
             # Tee-Object.  Previously this called ``& npm install --silent
@@ -2389,7 +2424,8 @@ function Install-NodeDeps {
             # for uv's stderr-emitting installer.  Check success via
             # $LASTEXITCODE, which is reliable regardless of stderr noise.
             $ErrorActionPreference = "Continue"
-            & $npmPath install --silent 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $logPath
+            $env:CI = "1"
+            & $npmPath @installArgs 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $logPath
             $code = $LASTEXITCODE
             $ErrorActionPreference = $prevEAP
             if ($code -eq 0) {
@@ -2417,15 +2453,36 @@ function Install-NodeDeps {
             Write-Warn "$label npm install could not be launched: $_"
             return $false
         } finally {
+            if ($null -eq $prevCI) {
+                Remove-Item Env:CI -ErrorAction SilentlyContinue
+            } else {
+                $env:CI = $prevCI
+            }
             Pop-Location
         }
     }
 
-    # Browser tools
-    if (Test-Path "$InstallDir\package.json") {
+    $commonNpmArgs = @(
+        "--registry=$NpmRegistry",
+        "--replace-registry-host=always",
+        "--no-audit",
+        "--no-fund",
+        "--progress=false",
+        "--fetch-retries=2",
+        "--fetch-timeout=60000",
+        "--loglevel=notice"
+    )
+
+    # Browser tools are fully optional for Java Runtime/CLI dogfood. A bare
+    # root `npm install` recursively resolves every workspace (desktop, web,
+    # TUI), which is both huge and misleadingly labelled as browser-only.
+    # Install only root dependencies, and only when browser support was
+    # explicitly requested.
+    if ($IncludeBrowser -and (Test-Path "$InstallDir\package.json")) {
         Write-Info "Installing Node.js dependencies (browser tools)..."
         $browserLog = "$env:TEMP\hermes-npm-browser-$(Get-Random).log"
-        $browserNpmOk = _Run-NpmInstall "Browser tools" $InstallDir $browserLog $npmExe
+        $browserArgs = @("install", "--workspaces=false") + $commonNpmArgs
+        $browserNpmOk = _Run-NpmInstall "Browser tools" $InstallDir $browserLog $npmExe $browserArgs
 
         # Playwright Chromium is a large optional download and is not needed by
         # Java Runtime dogfood. Keep it off the default install path; callers
@@ -2518,17 +2575,20 @@ function Install-NodeDeps {
                     Pop-Location
                 }
             }
-        } elseif ($browserNpmOk) {
-            Write-Info "Skipping Playwright Chromium (optional; pass -IncludeBrowser to install)"
         }
+    } elseif (Test-Path "$InstallDir\package.json") {
+        Write-Info "Skipping browser-tool Node dependencies (optional; pass -IncludeBrowser to install)"
     }
 
-    # TUI
+    # TUI: run from the workspace root and select only ui-tui. Running plain
+    # `npm install` inside a workspace can still make npm resolve every sibling
+    # workspace through the root lockfile, including Electron desktop deps.
     $tuiDir = "$InstallDir\ui-tui"
     if (Test-Path "$tuiDir\package.json") {
         Write-Info "Installing TUI dependencies..."
         $tuiLog = "$env:TEMP\hermes-npm-tui-$(Get-Random).log"
-        [void](_Run-NpmInstall "TUI" $tuiDir $tuiLog $npmExe)
+        $tuiArgs = @("install", "--workspace", "ui-tui", "--include-workspace-root=false") + $commonNpmArgs
+        [void](_Run-NpmInstall "TUI" $InstallDir $tuiLog $npmExe $tuiArgs)
     }
 }
 
