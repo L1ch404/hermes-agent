@@ -40,10 +40,30 @@ def test_installers_convert_existing_hermes_checkouts_to_jolink() -> None:
 
 
 def test_windows_zip_fallback_uses_jolink_archives() -> None:
-    archive_base = "https://github.com/L1ch404/hermes-agent/archive"
-    assert f'{archive_base}/$Commit.zip' in INSTALL_PS1
-    assert f'{archive_base}/refs/tags/$Tag.zip' in INSTALL_PS1
-    assert f'{archive_base}/refs/heads/$Branch.zip' in INSTALL_PS1
+    archive_base = "https://codeload.github.com/L1ch404/hermes-agent/zip"
+    assert f'{archive_base}/$Commit' in INSTALL_PS1
+    assert f'{archive_base}/refs/tags/$Tag' in INSTALL_PS1
+    assert f'{archive_base}/refs/heads/$Branch' in INSTALL_PS1
+    assert "-TimeoutSec 180" in INSTALL_PS1
+    assert (
+        f'{archive_base}/refs/heads/{{branch}}' in
+        Path(hermes_main.__file__).read_text(encoding="utf-8")
+    )
+
+
+def test_windows_repository_fallback_order_avoids_unnecessary_ssh_errors() -> None:
+    https_pos = INSTALL_PS1.index('Write-Info "Trying HTTPS clone..."')
+    zip_pos = INSTALL_PS1.index("downloading direct codeload ZIP instead")
+    ssh_pos = INSTALL_PS1.index("trying SSH clone as the final fallback")
+    assert https_pos < zip_pos < ssh_pos
+
+
+def test_windows_zip_fallback_creates_a_valid_git_head() -> None:
+    assert "git add -A" in INSTALL_PS1
+    assert '"user.name=joLink Installer"' in INSTALL_PS1
+    assert '-m "Bootstrap joLink from codeload archive"' in INSTALL_PS1
+    assert "$usedZipFallback = $true" in INSTALL_PS1
+    assert "-not $usedZipFallback" in INSTALL_PS1
 
 
 def test_runtime_update_sources_are_jolink() -> None:

@@ -6225,8 +6225,11 @@ def _update_via_zip(args):
             f"--branch {branch}`, or update against main with `hermes update`."
         )
         sys.exit(1)
+    # Use codeload directly. The conventional github.com/.../archive URL is
+    # only a redirect and provides no fallback when github.com itself is
+    # unreachable (a common failure mode on restricted networks).
     zip_url = (
-        f"https://github.com/L1ch404/hermes-agent/archive/refs/heads/{branch}.zip"
+        f"https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/{branch}"
     )
 
     print("→ Downloading latest version...")

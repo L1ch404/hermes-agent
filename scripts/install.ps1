@@ -1474,6 +1474,7 @@ function Install-Repository {
 
     if (-not $didUpdate) {
         $cloneSuccess = $false
+        $usedZipFallback = $false
 
         # Fix Windows git "copy-fd: write returned: Invalid argument" error.
         # Git for Windows can fail on atomic file operations (hook templates,
@@ -1485,46 +1486,42 @@ function Install-Repository {
         $env:GIT_CONFIG_VALUE_0 = "false"
         git config --global windows.appendAtomically false 2>$null
 
-        # Try SSH first, then HTTPS, with -c flag for atomic write fix
-        Write-Info "Trying SSH clone..."
-        $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
+        # This is a public repository, so HTTPS is the least surprising first
+        # choice.  SSH is kept as the final fallback for users who have GitHub
+        # keys configured, but it should not produce a host-key warning before
+        # the credential-free paths have been tried.
+        Write-Info "Trying HTTPS clone..."
         try {
-            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
+            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
             if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
         } catch { }
-        $env:GIT_SSH_COMMAND = $null
 
+        # Fallback: download directly from codeload.github.com.  Do not use the
+        # common github.com/.../archive URL here: that endpoint only redirects
+        # to codeload, so a network that cannot reach github.com never reaches
+        # the useful fallback at all.
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Info "SSH failed, trying HTTPS..."
-            try {
-                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
-                if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
-            } catch { }
-        }
-
-        # Fallback: download ZIP archive (bypasses git file I/O issues entirely)
-        if (-not $cloneSuccess) {
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "Git clone failed -- downloading ZIP archive instead..."
+            Write-Warn "HTTPS clone failed -- downloading direct codeload ZIP instead..."
             try {
                 # Pick the ZIP URL for the most-specific ref the caller asked
-                # for.  GitHub supports archive URLs for commits, tags, and
-                # branches; we honour Commit > Tag > Branch.
+                # for. codeload supports commits, tags, and branches; honour
+                # Commit > Tag > Branch.
                 if ($Commit) {
-                    $zipUrl = "https://github.com/L1ch404/hermes-agent/archive/$Commit.zip"
+                    $zipUrl = "https://codeload.github.com/L1ch404/hermes-agent/zip/$Commit"
                     $zipLabel = $Commit
                 } elseif ($Tag) {
-                    $zipUrl = "https://github.com/L1ch404/hermes-agent/archive/refs/tags/$Tag.zip"
+                    $zipUrl = "https://codeload.github.com/L1ch404/hermes-agent/zip/refs/tags/$Tag"
                     $zipLabel = $Tag
                 } else {
-                    $zipUrl = "https://github.com/L1ch404/hermes-agent/archive/refs/heads/$Branch.zip"
+                    $zipUrl = "https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/$Branch"
                     $zipLabel = $Branch
                 }
-                $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
+                $safeZipLabel = $zipLabel -replace '[^A-Za-z0-9._-]', '_'
+                $zipPath = "$env:TEMP\hermes-agent-$safeZipLabel.zip"
                 $extractPath = "$env:TEMP\hermes-agent-extract"
 
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
                 if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
                 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 
@@ -1535,27 +1532,60 @@ function Install-Repository {
                     Move-Item $extractedDir.FullName $InstallDir -Force
                     Write-Success "Downloaded and extracted"
 
-                    # Initialize git repo so updates work later
+                    # Initialize a real repository, including HEAD.  A bare
+                    # `git init` looks like a repository but fails the install
+                    # validity check on the next run because it has no commit.
                     Push-Location $InstallDir
-                    git -c windows.appendAtomically=false init 2>$null
-                    git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
-                    git remote add origin $RepoUrlHttps 2>$null
-                    Pop-Location
-                    Write-Success "Git repo initialized for future updates"
+                    $prevEAP = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    try {
+                        git -c windows.appendAtomically=false init
+                        if ($LASTEXITCODE -ne 0) { throw "git init failed (exit $LASTEXITCODE)" }
+                        git -c windows.appendAtomically=false config windows.appendAtomically false
+                        git -c windows.appendAtomically=false config core.autocrlf false
+                        git remote add origin $RepoUrlHttps
+                        git add -A
+                        if ($LASTEXITCODE -ne 0) { throw "git add failed (exit $LASTEXITCODE)" }
+                        git -c "user.name=joLink Installer" -c "user.email=installer@jolink.local" -c "commit.gpgsign=false" commit --no-verify -m "Bootstrap joLink from codeload archive"
+                        if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
+                        if (-not $Commit -and -not $Tag) {
+                            git branch -M $Branch
+                            if ($LASTEXITCODE -ne 0) { throw "git branch failed (exit $LASTEXITCODE)" }
+                        }
+                    } finally {
+                        $ErrorActionPreference = $prevEAP
+                        Pop-Location
+                    }
+                    Write-Success "Git repo initialized with a local bootstrap commit"
 
                     $cloneSuccess = $true
+                    $usedZipFallback = $true
                 }
 
                 # Cleanup temp files
                 Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
                 Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
             } catch {
-                Write-Err "ZIP download also failed: $_"
+                Write-Warn "Direct codeload ZIP failed: $_"
             }
         }
 
+        # Last resort: SSH may still work on a network where HTTPS/codeload is
+        # blocked, provided the user already trusts GitHub's host key and has a
+        # key configured for the repository.
         if (-not $cloneSuccess) {
-            throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"
+            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+            Write-Warn "Codeload failed, trying SSH clone as the final fallback..."
+            $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
+            try {
+                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
+                if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
+            } catch { }
+            $env:GIT_SSH_COMMAND = $null
+        }
+
+        if (-not $cloneSuccess) {
+            throw "Failed to download repository (tried HTTPS clone, direct codeload ZIP, and SSH clone)"
         }
     }
 
@@ -1572,7 +1602,7 @@ function Install-Repository {
     # $Branch's tip, honour the higher-precedence $Commit / $Tag by checking
     # the exact ref out as a detached HEAD.  Skipped for the in-place update
     # path (above) since that already routed via the same precedence.
-    if (-not $didUpdate) {
+    if (-not $didUpdate -and -not $usedZipFallback) {
         # Same EAP=Continue wrap as the update path -- git fetch's 'From <url>'
         # info line goes to stderr and would terminate the script under the
         # global EAP=Stop otherwise.  We check $LASTEXITCODE for real errors.
