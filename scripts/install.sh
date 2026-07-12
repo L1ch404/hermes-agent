@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.sh | bash
+#   curl -fsSL https://7355608.net/jolink/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -45,6 +45,8 @@ BOLD='\033[1m'
 # Configuration
 REPO_URL_SSH="git@github.com:L1ch404/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/L1ch404/hermes-agent.git"
+REPO_ARCHIVE_MIRROR="https://7355608.net/jolink/main.zip"
+REPO_ARCHIVE_MIRROR_SHA256="https://7355608.net/jolink/main.zip.sha256"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -1183,6 +1185,120 @@ show_manual_install_hint() {
 # Installation
 # ============================================================================
 
+install_repo_archive() {
+    local archive_url="$1"
+    local archive_hash_url="$2"
+    local source_label="$3"
+    local tmp_dir zip_path hash_path extract_dir extracted_dir archive_child
+
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/jolink-install.XXXXXX")"
+    zip_path="$tmp_dir/repository.zip"
+    hash_path="$tmp_dir/repository.zip.sha256"
+    extract_dir="$tmp_dir/extracted"
+
+    log_info "Trying $source_label..."
+    if ! curl -fL --connect-timeout 10 --max-time 300 "$archive_url" -o "$zip_path"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if [ -n "$archive_hash_url" ]; then
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 "$archive_hash_url" -o "$hash_path"; then
+            log_warn "$source_label SHA-256 file could not be downloaded"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$extract_dir"
+    if ! "$PYTHON_PATH" - "$zip_path" "$hash_path" "$extract_dir" "$archive_hash_url" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+import zipfile
+
+zip_path, hash_path, extract_dir, hash_url = sys.argv[1:]
+
+if hash_url:
+    with open(hash_path, encoding="utf-8") as hash_file:
+        parts = hash_file.read().strip().split()
+    if not parts or len(parts[0]) != 64 or any(
+        char not in "0123456789abcdefABCDEF" for char in parts[0]
+    ):
+        raise ValueError("mirror SHA-256 file is malformed")
+    expected = parts[0].lower()
+    digest = hashlib.sha256()
+    with open(zip_path, "rb") as archive_file:
+        for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise ValueError(
+            f"mirror SHA-256 mismatch (expected {expected}, got {actual})"
+        )
+
+extract_root = os.path.realpath(extract_dir)
+with zipfile.ZipFile(zip_path) as archive:
+    for member in archive.infolist():
+        target = os.path.realpath(os.path.join(extract_root, member.filename))
+        if target != extract_root and not target.startswith(extract_root + os.sep):
+            raise ValueError(f"ZIP member escapes extraction root: {member.filename}")
+        mode = (member.external_attr >> 16) & 0o170000
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"ZIP contains unsupported symlink: {member.filename}")
+    archive.extractall(extract_root)
+PY
+    then
+        log_warn "$source_label archive validation or extraction failed"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    extracted_dir=""
+    for archive_child in "$extract_dir"/*; do
+        if [ -d "$archive_child" ]; then
+            extracted_dir="$archive_child"
+            break
+        fi
+    done
+    if [ -z "$extracted_dir" ]; then
+        log_warn "$source_label archive did not contain a repository directory"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    if ! mv "$extracted_dir" "$INSTALL_DIR"; then
+        rm -rf "$tmp_dir" "$INSTALL_DIR"
+        return 1
+    fi
+    rm -rf "$tmp_dir"
+
+    # A real initial commit is required by the installer's validity checks and
+    # future stash/update paths. The next successful fetch resets this managed
+    # bootstrap checkout to origin/$BRANCH if histories differ.
+    if ! git -C "$INSTALL_DIR" init >/dev/null \
+        || ! git -C "$INSTALL_DIR" config core.autocrlf false \
+        || ! git -C "$INSTALL_DIR" remote add origin "$REPO_URL_HTTPS" \
+        || ! git -C "$INSTALL_DIR" add -A \
+        || ! git -C "$INSTALL_DIR" -c "user.name=joLink Installer" \
+            -c "user.email=installer@jolink.local" -c "commit.gpgsign=false" \
+            commit --no-verify -m "Bootstrap joLink from source archive" >/dev/null \
+        || ! git -C "$INSTALL_DIR" branch -M "$BRANCH"; then
+        log_warn "$source_label downloaded, but Git bootstrap initialization failed"
+        rm -rf "$INSTALL_DIR"
+        return 1
+    fi
+
+    if [ -n "$archive_hash_url" ]; then
+        log_success "Downloaded from $source_label (SHA-256 verified)"
+    else
+        log_success "Downloaded from $source_label"
+    fi
+    return 0
+}
+
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
@@ -1296,22 +1412,54 @@ clone_repo() {
             exit 1
         fi
     else
-        # Try SSH first (for private repo access), fall back to HTTPS
-        # GIT_SSH_COMMAND disables interactive prompts and sets a short timeout
-        # so SSH fails fast instead of hanging when no key is configured.
-        log_info "Trying SSH clone..."
-        if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
-           git clone --depth 1 --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
-            log_success "Cloned via SSH"
+        local repository_ready=false
+
+        log_info "Trying HTTPS clone..."
+        if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
+            log_success "Cloned via HTTPS"
+            repository_ready=true
         else
-            rm -rf "$INSTALL_DIR" 2>/dev/null  # Clean up partial SSH clone
-            log_info "SSH failed, trying HTTPS..."
-            if git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR"; then
-                log_success "Cloned via HTTPS"
+            rm -rf "$INSTALL_DIR" 2>/dev/null
+        fi
+
+        # Archive bootstrap is used only when no exact commit was requested.
+        # A source ZIP can reproduce a tree but cannot reproduce the original
+        # Git commit object/HEAD, so using it for --commit would violate the
+        # pinning contract.
+        if [ "$repository_ready" = false ] && [ -z "$INSTALL_COMMIT" ] \
+           && [ "$BRANCH" = "main" ]; then
+            if install_repo_archive "$REPO_ARCHIVE_MIRROR" \
+                "$REPO_ARCHIVE_MIRROR_SHA256" "joLink China mirror"; then
+                repository_ready=true
             else
-                log_error "Failed to clone repository"
-                exit 1
+                rm -rf "$INSTALL_DIR" 2>/dev/null
             fi
+        fi
+
+        if [ "$repository_ready" = false ] && [ -z "$INSTALL_COMMIT" ]; then
+            if install_repo_archive \
+                "https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/$BRANCH" \
+                "" "GitHub codeload"; then
+                repository_ready=true
+            else
+                rm -rf "$INSTALL_DIR" 2>/dev/null
+            fi
+        fi
+
+        # Last resort for users who already trust GitHub's host key and have a
+        # repository key configured.
+        if [ "$repository_ready" = false ]; then
+            log_info "Archive fallbacks failed, trying SSH clone..."
+            if GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5" \
+               git clone --depth 1 --branch "$BRANCH" "$REPO_URL_SSH" "$INSTALL_DIR" 2>/dev/null; then
+                log_success "Cloned via SSH"
+                repository_ready=true
+            fi
+        fi
+
+        if [ "$repository_ready" = false ]; then
+            log_error "Failed to download repository (tried HTTPS, archive fallbacks, and SSH)"
+            exit 1
         fi
     fi
 

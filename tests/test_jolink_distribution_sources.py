@@ -11,8 +11,8 @@ DOGFOOD_GUIDE = (REPO_ROOT / "JOLINK_DOGFOOD.md").read_text(encoding="utf-8")
 
 JOLINK_HTTPS = "https://github.com/L1ch404/hermes-agent.git"
 JOLINK_SSH = "git@github.com:L1ch404/hermes-agent.git"
-JOLINK_RAW = "https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts"
 JOLINK_WINDOWS_INSTALLER = "https://7355608.net/jolink/install.ps1"
+JOLINK_POSIX_INSTALLER = "https://7355608.net/jolink/install.sh"
 
 
 def test_installers_clone_the_jolink_repository() -> None:
@@ -23,10 +23,11 @@ def test_installers_clone_the_jolink_repository() -> None:
 
 
 def test_installers_publish_jolink_one_liners() -> None:
-    assert f"{JOLINK_RAW}/install.sh" in INSTALL_SH
     assert JOLINK_WINDOWS_INSTALLER in INSTALL_PS1
     assert JOLINK_WINDOWS_INSTALLER in INSTALL_SH
     assert JOLINK_WINDOWS_INSTALLER in DOGFOOD_GUIDE
+    assert JOLINK_POSIX_INSTALLER in INSTALL_SH
+    assert JOLINK_POSIX_INSTALLER in DOGFOOD_GUIDE
     assert "joLink Installer" in INSTALL_SH
     assert "joLink Installer" in INSTALL_PS1
 
@@ -76,6 +77,16 @@ def test_windows_zip_fallback_creates_a_valid_git_head() -> None:
     assert '-m "Bootstrap joLink from codeload archive"' in INSTALL_PS1
     assert "$usedZipFallback = $true" in INSTALL_PS1
     assert "-not $usedZipFallback" in INSTALL_PS1
+
+
+def test_posix_archive_fallback_uses_mirror_and_valid_git_head() -> None:
+    mirror_base = "https://7355608.net/jolink"
+    assert f'REPO_ARCHIVE_MIRROR="{mirror_base}/main.zip"' in INSTALL_SH
+    assert f'REPO_ARCHIVE_MIRROR_SHA256="{mirror_base}/main.zip.sha256"' in INSTALL_SH
+    assert '"joLink China mirror"' in INSTALL_SH
+    assert "https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/$BRANCH" in INSTALL_SH
+    assert 'commit --no-verify -m "Bootstrap joLink from source archive"' in INSTALL_SH
+    assert 'if [ "$repository_ready" = false ] && [ -z "$INSTALL_COMMIT" ]' in INSTALL_SH
 
 
 def test_runtime_update_sources_are_jolink() -> None:
