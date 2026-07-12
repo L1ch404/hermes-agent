@@ -1,7 +1,7 @@
 # Runtime Dogfood Notes: Scenario Trigger and Request Parameter Sources
 
-> Status: working notes  
-> Scope: Java Runtime / Debug Session dogfood  
+> Status: working notes
+> Scope: Java Runtime / Debug Session dogfood
 > Purpose: record practical problems found during dogfood, especially how to trigger real backend code paths and where HTTP request parameters should come from.
 
 ---
