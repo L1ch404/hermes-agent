@@ -12,6 +12,7 @@ DOGFOOD_GUIDE = (REPO_ROOT / "JOLINK_DOGFOOD.md").read_text(encoding="utf-8")
 JOLINK_HTTPS = "https://github.com/L1ch404/hermes-agent.git"
 JOLINK_SSH = "git@github.com:L1ch404/hermes-agent.git"
 JOLINK_RAW = "https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts"
+JOLINK_WINDOWS_INSTALLER = "https://7355608.net/jolink/install.ps1"
 
 
 def test_installers_clone_the_jolink_repository() -> None:
@@ -23,7 +24,9 @@ def test_installers_clone_the_jolink_repository() -> None:
 
 def test_installers_publish_jolink_one_liners() -> None:
     assert f"{JOLINK_RAW}/install.sh" in INSTALL_SH
-    assert f"{JOLINK_RAW}/install.ps1" in INSTALL_PS1
+    assert JOLINK_WINDOWS_INSTALLER in INSTALL_PS1
+    assert JOLINK_WINDOWS_INSTALLER in INSTALL_SH
+    assert JOLINK_WINDOWS_INSTALLER in DOGFOOD_GUIDE
     assert "joLink Installer" in INSTALL_SH
     assert "joLink Installer" in INSTALL_PS1
 
@@ -49,13 +52,22 @@ def test_windows_zip_fallback_uses_jolink_archives() -> None:
         f'{archive_base}/refs/heads/{{branch}}' in
         Path(hermes_main.__file__).read_text(encoding="utf-8")
     )
+    mirror_base = "https://7355608.net/jolink"
+    assert f'$RepoArchiveMirror = "{mirror_base}/main.zip"' in INSTALL_PS1
+    assert f'$RepoArchiveMirrorSha256 = "{mirror_base}/main.zip.sha256"' in INSTALL_PS1
+    main_source = Path(hermes_main.__file__).read_text(encoding="utf-8")
+    assert f'mirror_url = "{mirror_base}/main.zip"' in main_source
+    assert f'mirror_hash_url = "{mirror_base}/main.zip.sha256"' in main_source
+    assert "SHA-256 verified" in INSTALL_PS1
+    assert "SHA-256 verified" in main_source
 
 
 def test_windows_repository_fallback_order_avoids_unnecessary_ssh_errors() -> None:
     https_pos = INSTALL_PS1.index('Write-Info "Trying HTTPS clone..."')
-    zip_pos = INSTALL_PS1.index("downloading direct codeload ZIP instead")
+    mirror_pos = INSTALL_PS1.index('Write-Info "Trying joLink China mirror..."')
+    codeload_pos = INSTALL_PS1.index('Write-Info "Trying GitHub codeload..."')
     ssh_pos = INSTALL_PS1.index("trying SSH clone as the final fallback")
-    assert https_pos < zip_pos < ssh_pos
+    assert https_pos < mirror_pos < codeload_pos < ssh_pos
 
 
 def test_windows_zip_fallback_creates_a_valid_git_head() -> None:

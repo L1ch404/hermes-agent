@@ -5,7 +5,7 @@
 # Uses uv for fast Python provisioning and package management.
 #
 # Usage:
-#   iex (irm https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.ps1)
+#   iex (irm https://7355608.net/jolink/install.ps1)
 #
 # Or download and run with options:
 #   .\install.ps1 -NoVenv -SkipSetup
@@ -139,6 +139,8 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 
 $RepoUrlSsh = "git@github.com:L1ch404/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/L1ch404/hermes-agent.git"
+$RepoArchiveMirror = "https://7355608.net/jolink/main.zip"
+$RepoArchiveMirrorSha256 = "https://7355608.net/jolink/main.zip.sha256"
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -1496,13 +1498,14 @@ function Install-Repository {
             if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
         } catch { }
 
-        # Fallback: download directly from codeload.github.com.  Do not use the
-        # common github.com/.../archive URL here: that endpoint only redirects
-        # to codeload, so a network that cannot reach github.com never reaches
-        # the useful fallback at all.
+        # ZIP fallbacks bypass git file I/O entirely. For the default main
+        # channel, prefer the joLink-operated mainland mirror and verify its
+        # published SHA-256. Pinned commits, tags, and non-main branches bypass
+        # the mirror because it intentionally contains only main's latest tip.
+        # GitHub codeload remains the credential-free fallback for every ref.
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "HTTPS clone failed -- downloading direct codeload ZIP instead..."
+            Write-Warn "HTTPS clone failed -- downloading ZIP fallback instead..."
             try {
                 # Pick the ZIP URL for the most-specific ref the caller asked
                 # for. codeload supports commits, tags, and branches; honour
@@ -1519,9 +1522,36 @@ function Install-Repository {
                 }
                 $safeZipLabel = $zipLabel -replace '[^A-Za-z0-9._-]', '_'
                 $zipPath = "$env:TEMP\hermes-agent-$safeZipLabel.zip"
+                $zipHashPath = "$zipPath.sha256"
                 $extractPath = "$env:TEMP\hermes-agent-extract"
+                $downloadedZip = $false
 
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
+                if (-not $Commit -and -not $Tag -and $Branch -eq "main") {
+                    Write-Info "Trying joLink China mirror..."
+                    try {
+                        Invoke-WebRequest -Uri $RepoArchiveMirror -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
+                        Invoke-WebRequest -Uri $RepoArchiveMirrorSha256 -OutFile $zipHashPath -UseBasicParsing -TimeoutSec 30
+                        $expectedHash = ((Get-Content $zipHashPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+                        if ($expectedHash -notmatch '^[0-9a-f]{64}$') {
+                            throw "mirror SHA-256 file is malformed"
+                        }
+                        $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                        if ($actualHash -ne $expectedHash) {
+                            throw "mirror SHA-256 mismatch (expected $expectedHash, got $actualHash)"
+                        }
+                        $downloadedZip = $true
+                        Write-Success "Downloaded from joLink China mirror (SHA-256 verified)"
+                    } catch {
+                        Write-Warn "joLink China mirror failed: $_"
+                        Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+                        Remove-Item -Force $zipHashPath -ErrorAction SilentlyContinue
+                    }
+                }
+
+                if (-not $downloadedZip) {
+                    Write-Info "Trying GitHub codeload..."
+                    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 180
+                }
                 if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
                 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 
@@ -1564,9 +1594,10 @@ function Install-Repository {
 
                 # Cleanup temp files
                 Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+                Remove-Item -Force $zipHashPath -ErrorAction SilentlyContinue
                 Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
             } catch {
-                Write-Warn "Direct codeload ZIP failed: $_"
+                Write-Warn "ZIP fallbacks failed: $_"
             }
         }
 
@@ -3573,7 +3604,7 @@ try {
     Write-Err "Installation failed: $_"
     Write-Host ""
     Write-Info "If the error is unclear, try downloading and running the script directly:"
-    Write-Host "  Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.ps1' -OutFile install.ps1" -ForegroundColor Yellow
+    Write-Host "  Invoke-WebRequest -Uri 'https://7355608.net/jolink/install.ps1' -OutFile install.ps1" -ForegroundColor Yellow
     Write-Host "  .\install.ps1" -ForegroundColor Yellow
     Write-Host ""
 }

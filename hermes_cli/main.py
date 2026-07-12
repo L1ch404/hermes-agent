@@ -6225,10 +6225,12 @@ def _update_via_zip(args):
             f"--branch {branch}`, or update against main with `hermes update`."
         )
         sys.exit(1)
-    # Use codeload directly. The conventional github.com/.../archive URL is
-    # only a redirect and provides no fallback when github.com itself is
-    # unreachable (a common failure mode on restricted networks).
-    zip_url = (
+    mirror_url = "https://7355608.net/jolink/main.zip"
+    mirror_hash_url = "https://7355608.net/jolink/main.zip.sha256"
+    # Use codeload directly as the public fallback. The conventional
+    # github.com/.../archive URL is only a redirect and provides no fallback
+    # when github.com itself is unreachable.
+    codeload_url = (
         f"https://codeload.github.com/L1ch404/hermes-agent/zip/refs/heads/{branch}"
     )
 
@@ -6236,7 +6238,35 @@ def _update_via_zip(args):
     tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
-        urlretrieve(zip_url, zip_path)
+        hash_path = zip_path + ".sha256"
+        try:
+            print("→ Trying joLink China mirror...")
+            urlretrieve(mirror_url, zip_path)
+            urlretrieve(mirror_hash_url, hash_path)
+
+            import hashlib
+
+            with open(hash_path, encoding="utf-8") as hash_file:
+                expected_hash = hash_file.read().strip().split()[0].lower()
+            if len(expected_hash) != 64 or any(
+                char not in "0123456789abcdef" for char in expected_hash
+            ):
+                raise ValueError("mirror SHA-256 file is malformed")
+            digest = hashlib.sha256()
+            with open(zip_path, "rb") as archive_file:
+                for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_hash = digest.hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    "mirror SHA-256 mismatch "
+                    f"(expected {expected_hash}, got {actual_hash})"
+                )
+            print("✓ Downloaded from joLink China mirror (SHA-256 verified)")
+        except Exception as mirror_error:
+            print(f"⚠ joLink China mirror failed: {mirror_error}")
+            print("→ Falling back to GitHub codeload...")
+            urlretrieve(codeload_url, zip_path)
 
         print("→ Extracting...")
         import stat as _stat
