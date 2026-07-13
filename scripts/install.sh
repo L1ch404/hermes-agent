@@ -1321,15 +1321,28 @@ clone_repo() {
             cd "$INSTALL_DIR"
 
             local current_origin
+            local origin_exists
             local pre_jolink_branch
             local switched_to_jolink_origin=false
-            current_origin="$(git remote get-url origin 2>/dev/null || true)"
+            if current_origin="$(git remote get-url origin 2>/dev/null)"; then
+                origin_exists=true
+            else
+                current_origin=""
+                origin_exists=false
+            fi
             if [ "$current_origin" != "$REPO_URL_HTTPS" ] && [ "$current_origin" != "$REPO_URL_SSH" ]; then
                 log_warn "Switching existing installation to the joLink release repository."
                 pre_jolink_branch="pre-jolink-$(date -u +%Y%m%d-%H%M%S)"
                 git branch "$pre_jolink_branch" HEAD
                 log_info "Preserved previous source revision as branch $pre_jolink_branch"
-                git remote set-url origin "$REPO_URL_HTTPS"
+                if [ "$origin_exists" = true ]; then
+                    git remote set-url origin "$REPO_URL_HTTPS"
+                else
+                    # Older archive/bootstrap installs can be valid Git
+                    # repositories without a remote. Recreate the managed
+                    # origin rather than failing the update.
+                    git remote add origin "$REPO_URL_HTTPS"
+                fi
                 switched_to_jolink_origin=true
             fi
 

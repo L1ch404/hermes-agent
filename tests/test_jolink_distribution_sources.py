@@ -34,10 +34,14 @@ def test_installers_publish_jolink_one_liners() -> None:
 
 def test_installers_convert_existing_hermes_checkouts_to_jolink() -> None:
     assert 'git remote set-url origin "$REPO_URL_HTTPS"' in INSTALL_SH
+    assert 'git remote add origin "$REPO_URL_HTTPS"' in INSTALL_SH
+    assert 'if [ "$origin_exists" = true ]' in INSTALL_SH
     assert 'git checkout -B "$BRANCH" "origin/$BRANCH"' in INSTALL_SH
     assert "pre-jolink-" in INSTALL_SH
     assert "Switching existing installation to the joLink release repository." in INSTALL_SH
     assert "remote set-url origin $RepoUrlHttps" in INSTALL_PS1
+    assert "remote add origin $RepoUrlHttps" in INSTALL_PS1
+    assert "if ($originExists)" in INSTALL_PS1
     assert 'checkout -B $Branch "origin/$Branch"' in INSTALL_PS1
     assert "pre-jolink-" in INSTALL_PS1
     assert "Switching existing installation to the joLink release repository." in INSTALL_PS1

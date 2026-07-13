@@ -1358,15 +1358,25 @@ function Install-Repository {
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                 $switchedToJolinkOrigin = $false
-                $currentOrigin = (git -c windows.appendAtomically=false remote get-url origin 2>$null | Out-String).Trim()
+                $currentOriginOutput = git -c windows.appendAtomically=false remote get-url origin 2>$null
+                $originExists = ($LASTEXITCODE -eq 0)
+                $currentOrigin = ($currentOriginOutput | Out-String).Trim()
                 if ($currentOrigin -ne $RepoUrlHttps -and $currentOrigin -ne $RepoUrlSsh) {
                     Write-Warn "Switching existing installation to the joLink release repository."
                     $preJolinkBranch = "pre-jolink-" + (Get-Date -Format "yyyyMMdd-HHmmss")
                     git -c windows.appendAtomically=false branch $preJolinkBranch HEAD
                     if ($LASTEXITCODE -ne 0) { throw "git backup branch failed (exit $LASTEXITCODE)" }
                     Write-Info "Preserved previous source revision as branch $preJolinkBranch"
-                    git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
-                    if ($LASTEXITCODE -ne 0) { throw "git remote set-url failed (exit $LASTEXITCODE)" }
+                    if ($originExists) {
+                        git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                        if ($LASTEXITCODE -ne 0) { throw "git remote set-url failed (exit $LASTEXITCODE)" }
+                    } else {
+                        # Older ZIP/bootstrap installs can have a valid Git
+                        # HEAD but no remotes. Treat that as a recoverable
+                        # managed checkout instead of failing set-url.
+                        git -c windows.appendAtomically=false remote add origin $RepoUrlHttps
+                        if ($LASTEXITCODE -ne 0) { throw "git remote add failed (exit $LASTEXITCODE)" }
+                    }
                     $switchedToJolinkOrigin = $true
                 }
                 Discard-LockfileChurn $InstallDir
