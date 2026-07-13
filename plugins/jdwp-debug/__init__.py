@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 JAVA_RUNTIME_SCHEMA = {
     "name": "java_runtime",
     "description": (
-        "Observe and control a running Java application using real execution-time evidence. "
+        "An LLM-facing Java debugger for observing and controlling a running Java application "
+        "using real execution-time evidence. "
         "Use this tool to investigate bugs, unfamiliar code, actual execution paths, "
         "exceptions, call stacks, variables, object state, data flow, runtime configuration, "
         "permission context, and application behavior when source code, logs, tests, or error "

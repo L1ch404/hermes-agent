@@ -1,11 +1,16 @@
 ---
 name: observation
-description: Use live Java Runtime evidence to investigate actual execution paths, exceptions, call stacks, variables, object state, data flow, configuration, permission context, and application behavior when source code, logs, tests, or error messages are insufficient.
+description: Use the Java Runtime as an LLM-facing Java debugger to diagnose bugs and inspect actual execution paths, exceptions, call stacks, variables, object state, data flow, configuration, permission context, and application behavior.
 ---
 
-# Java Runtime Observation and Investigation
+# Java Runtime Debugging and Observation
 
-Use the Java Runtime tool to observe and control a running Java application.
+Think of the Java Runtime first as an LLM-facing debugger for a running
+Java application.
+
+These debugging primitives are not limited to bug fixing. They can also be
+combined to inspect execution paths, data flow, configuration, permission
+context, and actual application behavior.
 
 The Runtime provides real execution-time evidence, including:
 
